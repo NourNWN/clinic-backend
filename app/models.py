@@ -67,6 +67,7 @@ class Service(db.Model):
     description_ar = db.Column(db.Text)
     description_en = db.Column(db.Text)
     duration_estimate = db.Column(db.Integer)  # بالدقائق
+    is_available = db.Column(db.Boolean, default=True, nullable=False)
 
     category = db.relationship("Category", backref="services")
     variants = db.relationship("ServiceVariant", backref="service")
