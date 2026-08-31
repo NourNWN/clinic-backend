@@ -21,6 +21,9 @@ EDITABLE_SERVICE_FIELDS = {
 }
 REQUIRED_VARIANT_FIELDS = ["brand_name_ar", "brand_name_en", "price_usd"]
 
+REQUIRED_CATEGORY_FIELDS = ["name_ar", "name_en"]
+EDITABLE_CATEGORY_FIELDS = {"name_ar", "name_en"}
+
 INVALID_CREDENTIALS_ERROR = {
     "error": {
         "code": "invalid_credentials",
@@ -115,6 +118,48 @@ def _variant_not_found_error(variant_id):
             "message_ar": f"الماركة رقم {variant_id} غير موجودة بهذه الخدمة",
             "message_en": f"Variant {variant_id} not found on this service",
         }
+    }
+
+
+def _duplicate_category_error(field):
+    return {
+        "error": {
+            "code": "duplicate_category",
+            "message_ar": f"يوجد فئة أخرى بنفس القيمة بالحقل: {field}",
+            "message_en": f"Another category already uses this value for: {field}",
+        }
+    }
+
+
+def _clean_category_name(value):
+    """Trimmed name if `value` is a non-empty string, else None."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _duplicate_category_field(name_ar=None, name_en=None, exclude_id=None):
+    """Returns the name of the first field ('name_ar'/'name_en') that
+    collides case-insensitively with another category, or None."""
+    base_query = Category.query
+    if exclude_id is not None:
+        base_query = base_query.filter(Category.id != exclude_id)
+
+    if name_ar is not None:
+        if base_query.filter(db.func.lower(Category.name_ar) == name_ar.lower()).first():
+            return "name_ar"
+    if name_en is not None:
+        if base_query.filter(db.func.lower(Category.name_en) == name_en.lower()).first():
+            return "name_en"
+    return None
+
+
+def _serialize_category(c):
+    return {
+        "id": c.id,
+        "name_ar": c.name_ar,
+        "name_en": c.name_en,
     }
 
 
@@ -506,3 +551,79 @@ def delete_service(service_id):
         db.session.commit()
 
     return jsonify(_serialize_service(service))
+
+
+@admin_bp.route("/api/admin/categories")
+@require_auth
+def get_categories():
+    categories = Category.query.order_by(Category.id.asc()).all()
+    return jsonify([_serialize_category(c) for c in categories])
+
+
+@admin_bp.route("/api/admin/categories", methods=["POST"])
+@require_auth
+def create_category():
+    data = request.get_json(silent=True) or {}
+
+    missing = [f for f in REQUIRED_CATEGORY_FIELDS if not data.get(f)]
+    if missing:
+        return jsonify(_missing_fields_error(missing)), 400
+
+    name_ar = _clean_category_name(data["name_ar"])
+    if name_ar is None:
+        return jsonify(_invalid_field_error("name_ar")), 400
+
+    name_en = _clean_category_name(data["name_en"])
+    if name_en is None:
+        return jsonify(_invalid_field_error("name_en")), 400
+
+    dup_field = _duplicate_category_field(name_ar, name_en)
+    if dup_field:
+        return jsonify(_duplicate_category_error(dup_field)), 409
+
+    category = Category(name_ar=name_ar, name_en=name_en)
+    db.session.add(category)
+    db.session.commit()
+
+    return jsonify(_serialize_category(category)), 201
+
+
+@admin_bp.route("/api/admin/categories/<int:category_id>", methods=["PUT"])
+@require_auth
+def update_category(category_id):
+    category = Category.query.get(category_id)
+    if not category:
+        return jsonify(CATEGORY_NOT_FOUND_ERROR), 404
+
+    data = request.get_json(silent=True) or {}
+    fields_present = EDITABLE_CATEGORY_FIELDS & data.keys()
+    if not fields_present:
+        return jsonify(NO_RECOGNIZED_FIELDS_ERROR), 400
+
+    new_names = {}
+    if "name_ar" in fields_present:
+        cleaned = _clean_category_name(data["name_ar"])
+        if cleaned is None:
+            return jsonify(_invalid_field_error("name_ar")), 400
+        new_names["name_ar"] = cleaned
+
+    if "name_en" in fields_present:
+        cleaned = _clean_category_name(data["name_en"])
+        if cleaned is None:
+            return jsonify(_invalid_field_error("name_en")), 400
+        new_names["name_en"] = cleaned
+
+    dup_field = _duplicate_category_field(
+        new_names.get("name_ar"), new_names.get("name_en"), exclude_id=category.id
+    )
+    if dup_field:
+        return jsonify(_duplicate_category_error(dup_field)), 409
+
+    # Only the name fields are touched — id and all relationships
+    # (e.g. Service.category_id) are left completely untouched.
+    for field, value in new_names.items():
+        setattr(category, field, value)
+
+    db.session.commit()
+
+    return jsonify(_serialize_category(category))
