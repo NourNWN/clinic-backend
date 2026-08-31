@@ -31,7 +31,7 @@ def get_concerns():
 
 @services_bp.route("/api/doctors")
 def get_doctors():
-    doctors = Doctor.query.all()
+    doctors = Doctor.query.filter(Doctor.is_available.is_(True)).all()
     return jsonify([
         {
             "id": d.id,
@@ -151,7 +151,7 @@ def get_service_detail(service_id):
         ],
         "doctors": [
             {"id": d.id, "name_ar": d.name_ar, "name_en": d.name_en, "photo_url": d.photo_url}
-            for d in service.doctors
+            for d in service.doctors if d.is_available
         ],
         "variants": variants_data,
     })

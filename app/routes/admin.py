@@ -6,7 +6,7 @@ from werkzeug.security import check_password_hash
 
 from app.auth import generate_token, require_auth
 from app.extensions import db
-from app.models import AdminUser, Appointment, Category, Concern, Service, ServiceVariant
+from app.models import AdminUser, Appointment, Category, Concern, Doctor, Service, ServiceVariant
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -26,6 +26,13 @@ EDITABLE_CATEGORY_FIELDS = {"name_ar", "name_en"}
 
 REQUIRED_CONCERN_FIELDS = ["name_ar", "name_en"]
 EDITABLE_CONCERN_FIELDS = {"name_ar", "name_en", "description_ar", "description_en"}
+
+REQUIRED_DOCTOR_FIELDS = ["name_ar", "name_en"]
+EDITABLE_DOCTOR_FIELDS = {
+    "name_ar", "name_en", "specialty_ar", "specialty_en",
+    "bio_ar", "bio_en", "photo_url", "is_available",
+}
+DOCTOR_STRING_FIELDS = ("specialty_ar", "specialty_en", "bio_ar", "bio_en", "photo_url")
 
 INVALID_CREDENTIALS_ERROR = {
     "error": {
@@ -88,6 +95,14 @@ CONCERN_NOT_FOUND_ERROR = {
         "code": "concern_not_found",
         "message_ar": "المشكلة غير موجودة",
         "message_en": "Concern not found",
+    }
+}
+
+DOCTOR_NOT_FOUND_ERROR = {
+    "error": {
+        "code": "doctor_not_found",
+        "message_ar": "الطبيبة غير موجودة",
+        "message_en": "Doctor not found",
     }
 }
 
@@ -192,6 +207,52 @@ def _serialize_concern(c):
         "name_en": c.name_en,
         "description_ar": c.description_ar,
         "description_en": c.description_en,
+    }
+
+
+def _invalid_service_ids_error(invalid_ids):
+    return {
+        "error": {
+            "code": "invalid_service_ids",
+            "message_ar": f"معرفات خدمات غير موجودة: {', '.join(map(str, invalid_ids))}",
+            "message_en": f"Unknown service id(s): {', '.join(map(str, invalid_ids))}",
+        }
+    }
+
+
+def _validate_service_ids(raw):
+    """Validates a `service_ids` payload. Returns (services, error) where
+    `error` is a response dict (and `services` is None) on failure, or
+    the matching Service rows (and `error` is None) on success."""
+    if not isinstance(raw, list) or not all(isinstance(i, int) for i in raw):
+        return None, _invalid_field_error("service_ids")
+
+    unique_ids = list(dict.fromkeys(raw))
+    services = Service.query.filter(Service.id.in_(unique_ids)).all() if unique_ids else []
+
+    found_ids = {s.id for s in services}
+    missing = [i for i in unique_ids if i not in found_ids]
+    if missing:
+        return None, _invalid_service_ids_error(missing)
+
+    return services, None
+
+
+def _serialize_doctor(d):
+    return {
+        "id": d.id,
+        "name_ar": d.name_ar,
+        "name_en": d.name_en,
+        "specialty_ar": d.specialty_ar,
+        "specialty_en": d.specialty_en,
+        "bio_ar": d.bio_ar,
+        "bio_en": d.bio_en,
+        "photo_url": d.photo_url,
+        "is_available": d.is_available,
+        "service_ids": [s.id for s in d.services],
+        "services": [
+            {"id": s.id, "name_ar": s.name_ar, "name_en": s.name_en} for s in d.services
+        ],
     }
 
 
@@ -751,3 +812,131 @@ def update_concern(concern_id):
     db.session.commit()
 
     return jsonify(_serialize_concern(concern))
+
+
+@admin_bp.route("/api/admin/doctors")
+@require_auth
+def get_doctors():
+    query = Doctor.query.options(joinedload(Doctor.services))
+
+    is_available = request.args.get("is_available")
+    if is_available is not None:
+        query = query.filter(Doctor.is_available == (is_available.lower() == "true"))
+
+    doctors = query.order_by(Doctor.id.asc()).all()
+
+    return jsonify([_serialize_doctor(d) for d in doctors])
+
+
+@admin_bp.route("/api/admin/doctors", methods=["POST"])
+@require_auth
+def create_doctor():
+    data = request.get_json(silent=True) or {}
+
+    missing = [f for f in REQUIRED_DOCTOR_FIELDS if not data.get(f)]
+    if missing:
+        return jsonify(_missing_fields_error(missing)), 400
+
+    name_ar = _clean_name(data["name_ar"])
+    if name_ar is None:
+        return jsonify(_invalid_field_error("name_ar")), 400
+
+    name_en = _clean_name(data["name_en"])
+    if name_en is None:
+        return jsonify(_invalid_field_error("name_en")), 400
+
+    for field in DOCTOR_STRING_FIELDS:
+        if field in data and data[field] is not None and not isinstance(data[field], str):
+            return jsonify(_invalid_field_error(field)), 400
+
+    if "is_available" in data and data["is_available"] is not None \
+            and not isinstance(data["is_available"], bool):
+        return jsonify(_invalid_field_error("is_available")), 400
+
+    services = []
+    if "service_ids" in data:
+        services, error = _validate_service_ids(data["service_ids"])
+        if error:
+            return jsonify(error), 400
+
+    doctor = Doctor(
+        name_ar=name_ar,
+        name_en=name_en,
+        specialty_ar=data.get("specialty_ar"),
+        specialty_en=data.get("specialty_en"),
+        bio_ar=data.get("bio_ar"),
+        bio_en=data.get("bio_en"),
+        photo_url=data.get("photo_url"),
+        is_available=data.get("is_available", True),
+    )
+    doctor.services = services
+    db.session.add(doctor)
+    db.session.commit()
+
+    return jsonify(_serialize_doctor(doctor)), 201
+
+
+@admin_bp.route("/api/admin/doctors/<int:doctor_id>", methods=["PUT"])
+@require_auth
+def update_doctor(doctor_id):
+    doctor = Doctor.query.options(joinedload(Doctor.services)).get(doctor_id)
+    if not doctor:
+        return jsonify(DOCTOR_NOT_FOUND_ERROR), 404
+
+    data = request.get_json(silent=True) or {}
+    fields_present = EDITABLE_DOCTOR_FIELDS & data.keys()
+    service_ids_present = "service_ids" in data
+
+    if not fields_present and not service_ids_present:
+        return jsonify(NO_RECOGNIZED_FIELDS_ERROR), 400
+
+    for field in ("name_ar", "name_en"):
+        if field in fields_present and _clean_name(data[field]) is None:
+            return jsonify(_invalid_field_error(field)), 400
+
+    for field in DOCTOR_STRING_FIELDS:
+        if field in fields_present and data[field] is not None and not isinstance(data[field], str):
+            return jsonify(_invalid_field_error(field)), 400
+
+    if "is_available" in fields_present and not isinstance(data["is_available"], bool):
+        return jsonify(_invalid_field_error("is_available")), 400
+
+    services = None
+    if service_ids_present:
+        services, error = _validate_service_ids(data["service_ids"])
+        if error:
+            return jsonify(error), 400
+
+    for field in fields_present:
+        if field in ("name_ar", "name_en"):
+            setattr(doctor, field, _clean_name(data[field]))
+        else:
+            setattr(doctor, field, data[field])
+
+    if services is not None:
+        # Replaces the full doctor_services association set in one call —
+        # e.g. {"service_ids": [1, 2, 5]} links exactly those services and
+        # unlinks any others. Appointment history is untouched either way,
+        # since appointments reference service_variant_id/doctor_id directly.
+        doctor.services = services
+
+    db.session.commit()
+
+    return jsonify(_serialize_doctor(doctor))
+
+
+@admin_bp.route("/api/admin/doctors/<int:doctor_id>", methods=["DELETE"])
+@require_auth
+def delete_doctor(doctor_id):
+    doctor = Doctor.query.get(doctor_id)
+    if not doctor:
+        return jsonify(DOCTOR_NOT_FOUND_ERROR), 404
+
+    # Soft-disable only — a hard delete would violate the NOT NULL
+    # Appointment.doctor_id FK for any doctor with appointment history,
+    # and would silently drop their doctor_services associations.
+    if doctor.is_available:
+        doctor.is_available = False
+        db.session.commit()
+
+    return jsonify(_serialize_doctor(doctor))
