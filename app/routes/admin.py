@@ -6,7 +6,7 @@ from werkzeug.security import check_password_hash
 
 from app.auth import generate_token, require_auth
 from app.extensions import db
-from app.models import AdminUser, Appointment, Category, Service, ServiceVariant
+from app.models import AdminUser, Appointment, Category, Concern, Service, ServiceVariant
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -23,6 +23,9 @@ REQUIRED_VARIANT_FIELDS = ["brand_name_ar", "brand_name_en", "price_usd"]
 
 REQUIRED_CATEGORY_FIELDS = ["name_ar", "name_en"]
 EDITABLE_CATEGORY_FIELDS = {"name_ar", "name_en"}
+
+REQUIRED_CONCERN_FIELDS = ["name_ar", "name_en"]
+EDITABLE_CONCERN_FIELDS = {"name_ar", "name_en", "description_ar", "description_en"}
 
 INVALID_CREDENTIALS_ERROR = {
     "error": {
@@ -80,6 +83,14 @@ CATEGORY_NOT_FOUND_ERROR = {
     }
 }
 
+CONCERN_NOT_FOUND_ERROR = {
+    "error": {
+        "code": "concern_not_found",
+        "message_ar": "المشكلة غير موجودة",
+        "message_en": "Concern not found",
+    }
+}
+
 
 def _missing_fields_error(missing):
     return {
@@ -131,7 +142,17 @@ def _duplicate_category_error(field):
     }
 
 
-def _clean_category_name(value):
+def _duplicate_concern_error(field):
+    return {
+        "error": {
+            "code": "duplicate_concern",
+            "message_ar": f"يوجد مشكلة أخرى بنفس القيمة بالحقل: {field}",
+            "message_en": f"Another concern already uses this value for: {field}",
+        }
+    }
+
+
+def _clean_name(value):
     """Trimmed name if `value` is a non-empty string, else None."""
     if not isinstance(value, str):
         return None
@@ -139,19 +160,20 @@ def _clean_category_name(value):
     return trimmed or None
 
 
-def _duplicate_category_field(name_ar=None, name_en=None, exclude_id=None):
-    """Returns the name of the first field ('name_ar'/'name_en') that
-    collides case-insensitively with another category, or None."""
-    base_query = Category.query
+def _find_duplicate_field(model, exclude_id=None, **fields):
+    """Returns the name of the first field (from `fields`, a column name ->
+    cleaned value mapping) that collides case-insensitively with another row
+    of `model`, or None. A None value skips that field's check."""
+    base_query = model.query
     if exclude_id is not None:
-        base_query = base_query.filter(Category.id != exclude_id)
+        base_query = base_query.filter(model.id != exclude_id)
 
-    if name_ar is not None:
-        if base_query.filter(db.func.lower(Category.name_ar) == name_ar.lower()).first():
-            return "name_ar"
-    if name_en is not None:
-        if base_query.filter(db.func.lower(Category.name_en) == name_en.lower()).first():
-            return "name_en"
+    for field_name, value in fields.items():
+        if value is None:
+            continue
+        column = getattr(model, field_name)
+        if base_query.filter(db.func.lower(column) == value.lower()).first():
+            return field_name
     return None
 
 
@@ -160,6 +182,16 @@ def _serialize_category(c):
         "id": c.id,
         "name_ar": c.name_ar,
         "name_en": c.name_en,
+    }
+
+
+def _serialize_concern(c):
+    return {
+        "id": c.id,
+        "name_ar": c.name_ar,
+        "name_en": c.name_en,
+        "description_ar": c.description_ar,
+        "description_en": c.description_en,
     }
 
 
@@ -569,15 +601,15 @@ def create_category():
     if missing:
         return jsonify(_missing_fields_error(missing)), 400
 
-    name_ar = _clean_category_name(data["name_ar"])
+    name_ar = _clean_name(data["name_ar"])
     if name_ar is None:
         return jsonify(_invalid_field_error("name_ar")), 400
 
-    name_en = _clean_category_name(data["name_en"])
+    name_en = _clean_name(data["name_en"])
     if name_en is None:
         return jsonify(_invalid_field_error("name_en")), 400
 
-    dup_field = _duplicate_category_field(name_ar, name_en)
+    dup_field = _find_duplicate_field(Category, name_ar=name_ar, name_en=name_en)
     if dup_field:
         return jsonify(_duplicate_category_error(dup_field)), 409
 
@@ -602,19 +634,20 @@ def update_category(category_id):
 
     new_names = {}
     if "name_ar" in fields_present:
-        cleaned = _clean_category_name(data["name_ar"])
+        cleaned = _clean_name(data["name_ar"])
         if cleaned is None:
             return jsonify(_invalid_field_error("name_ar")), 400
         new_names["name_ar"] = cleaned
 
     if "name_en" in fields_present:
-        cleaned = _clean_category_name(data["name_en"])
+        cleaned = _clean_name(data["name_en"])
         if cleaned is None:
             return jsonify(_invalid_field_error("name_en")), 400
         new_names["name_en"] = cleaned
 
-    dup_field = _duplicate_category_field(
-        new_names.get("name_ar"), new_names.get("name_en"), exclude_id=category.id
+    dup_field = _find_duplicate_field(
+        Category, exclude_id=category.id,
+        name_ar=new_names.get("name_ar"), name_en=new_names.get("name_en"),
     )
     if dup_field:
         return jsonify(_duplicate_category_error(dup_field)), 409
@@ -627,3 +660,94 @@ def update_category(category_id):
     db.session.commit()
 
     return jsonify(_serialize_category(category))
+
+
+@admin_bp.route("/api/admin/concerns")
+@require_auth
+def get_concerns():
+    concerns = Concern.query.order_by(Concern.id.asc()).all()
+    return jsonify([_serialize_concern(c) for c in concerns])
+
+
+@admin_bp.route("/api/admin/concerns", methods=["POST"])
+@require_auth
+def create_concern():
+    data = request.get_json(silent=True) or {}
+
+    missing = [f for f in REQUIRED_CONCERN_FIELDS if not data.get(f)]
+    if missing:
+        return jsonify(_missing_fields_error(missing)), 400
+
+    name_ar = _clean_name(data["name_ar"])
+    if name_ar is None:
+        return jsonify(_invalid_field_error("name_ar")), 400
+
+    name_en = _clean_name(data["name_en"])
+    if name_en is None:
+        return jsonify(_invalid_field_error("name_en")), 400
+
+    for field in ("description_ar", "description_en"):
+        if field in data and data[field] is not None and not isinstance(data[field], str):
+            return jsonify(_invalid_field_error(field)), 400
+
+    dup_field = _find_duplicate_field(Concern, name_ar=name_ar, name_en=name_en)
+    if dup_field:
+        return jsonify(_duplicate_concern_error(dup_field)), 409
+
+    concern = Concern(
+        name_ar=name_ar,
+        name_en=name_en,
+        description_ar=data.get("description_ar"),
+        description_en=data.get("description_en"),
+    )
+    db.session.add(concern)
+    db.session.commit()
+
+    return jsonify(_serialize_concern(concern)), 201
+
+
+@admin_bp.route("/api/admin/concerns/<int:concern_id>", methods=["PUT"])
+@require_auth
+def update_concern(concern_id):
+    concern = Concern.query.get(concern_id)
+    if not concern:
+        return jsonify(CONCERN_NOT_FOUND_ERROR), 404
+
+    data = request.get_json(silent=True) or {}
+    fields_present = EDITABLE_CONCERN_FIELDS & data.keys()
+    if not fields_present:
+        return jsonify(NO_RECOGNIZED_FIELDS_ERROR), 400
+
+    new_names = {}
+    if "name_ar" in fields_present:
+        cleaned = _clean_name(data["name_ar"])
+        if cleaned is None:
+            return jsonify(_invalid_field_error("name_ar")), 400
+        new_names["name_ar"] = cleaned
+
+    if "name_en" in fields_present:
+        cleaned = _clean_name(data["name_en"])
+        if cleaned is None:
+            return jsonify(_invalid_field_error("name_en")), 400
+        new_names["name_en"] = cleaned
+
+    for field in ("description_ar", "description_en"):
+        if field in fields_present and data[field] is not None and not isinstance(data[field], str):
+            return jsonify(_invalid_field_error(field)), 400
+
+    dup_field = _find_duplicate_field(
+        Concern, exclude_id=concern.id,
+        name_ar=new_names.get("name_ar"), name_en=new_names.get("name_en"),
+    )
+    if dup_field:
+        return jsonify(_duplicate_concern_error(dup_field)), 409
+
+    # id and all relationships (e.g. the service_concerns associations)
+    # are left completely untouched — there is no delete route for concerns.
+    for field in ("name_ar", "name_en", "description_ar", "description_en"):
+        if field in fields_present:
+            setattr(concern, field, new_names.get(field, data[field]))
+
+    db.session.commit()
+
+    return jsonify(_serialize_concern(concern))
