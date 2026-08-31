@@ -19,4 +19,11 @@ def create_app():
     from app.routes.appointments import appointments_bp
     app.register_blueprint(appointments_bp)
 
+    from app.routes.health import health_bp
+    app.register_blueprint(health_bp)
+
+    from app.routes.admin import admin_bp
+    app.register_blueprint(admin_bp)
+
     return app
+
