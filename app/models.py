@@ -50,6 +50,7 @@ class Doctor(db.Model):
     bio_ar = db.Column(db.Text)
     bio_en = db.Column(db.Text)
     photo_url = db.Column(db.String(255))
+    is_available = db.Column(db.Boolean, default=True, nullable=False)
 
     services = db.relationship("Service", secondary=doctor_services, back_populates="doctors")
 
