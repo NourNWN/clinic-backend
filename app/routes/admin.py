@@ -1,12 +1,14 @@
 from datetime import date, datetime, timedelta
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 from sqlalchemy.orm import joinedload
 from werkzeug.security import check_password_hash
 
-from app.auth import generate_token, require_auth
+from app.auth import generate_token, require_auth, require_role
 from app.extensions import db
-from app.models import AdminUser, Appointment, Category, Concern, Doctor, Service, ServiceVariant
+from app.models import (
+    AdminUser, Appointment, Category, Concern, Doctor, Offer, OfferItem, Service, ServiceVariant,
+)
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -33,6 +35,10 @@ EDITABLE_DOCTOR_FIELDS = {
     "bio_ar", "bio_en", "photo_url", "is_available",
 }
 DOCTOR_STRING_FIELDS = ("specialty_ar", "specialty_en", "bio_ar", "bio_en", "photo_url")
+
+REQUIRED_OFFER_FIELDS = ["title_ar", "title_en", "start_date", "end_date", "items"]
+EDITABLE_OFFER_FIELDS = {"title_ar", "title_en", "start_date", "end_date", "is_active"}
+REQUIRED_OFFER_ITEM_FIELDS = ["service_variant_id", "offer_price_syp"]
 
 INVALID_CREDENTIALS_ERROR = {
     "error": {
@@ -103,6 +109,14 @@ DOCTOR_NOT_FOUND_ERROR = {
         "code": "doctor_not_found",
         "message_ar": "الطبيبة غير موجودة",
         "message_en": "Doctor not found",
+    }
+}
+
+OFFER_NOT_FOUND_ERROR = {
+    "error": {
+        "code": "offer_not_found",
+        "message_ar": "العرض غير موجود",
+        "message_en": "Offer not found",
     }
 }
 
@@ -253,6 +267,121 @@ def _serialize_doctor(d):
         "services": [
             {"id": s.id, "name_ar": s.name_ar, "name_en": s.name_en} for s in d.services
         ],
+    }
+
+
+def _invalid_offer_item_error(index, field):
+    return {
+        "error": {
+            "code": "validation_error",
+            "message_ar": f"قيمة غير صالحة بعنصر العرض رقم {index + 1}: {field}",
+            "message_en": f"Invalid value in offer item #{index + 1}: {field}",
+        }
+    }
+
+
+def _offer_item_variant_not_found_error(index, variant_id):
+    return {
+        "error": {
+            "code": "service_variant_not_found",
+            "message_ar": f"الماركة رقم {variant_id} غير موجودة (عنصر العرض رقم {index + 1})",
+            "message_en": f"Service variant {variant_id} not found (offer item #{index + 1})",
+        }
+    }
+
+
+def _offer_item_not_found_error(item_id):
+    return {
+        "error": {
+            "code": "offer_item_not_found",
+            "message_ar": f"عنصر العرض رقم {item_id} غير موجود بهذا العرض",
+            "message_en": f"Offer item {item_id} not found on this offer",
+        }
+    }
+
+
+def _duplicate_offer_item_error(variant_id):
+    return {
+        "error": {
+            "code": "duplicate_offer_item",
+            "message_ar": f"لا يمكن تكرار الماركة رقم {variant_id} أكثر من مرة بنفس العرض",
+            "message_en": f"Service variant {variant_id} cannot appear more than once in the same offer",
+        }
+    }
+
+
+def _invalid_date_range_error():
+    return {
+        "error": {
+            "code": "invalid_date_range",
+            "message_ar": "يجب أن يكون تاريخ البداية قبل أو يساوي تاريخ النهاية",
+            "message_en": "start_date must be on or before end_date",
+        }
+    }
+
+
+def _parse_date(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _validate_offer_item_payload(item, index, *, required):
+    """Validate a single offer-item dict from the request body.
+    Returns an error dict, or None if valid."""
+    if not isinstance(item, dict):
+        return _invalid_offer_item_error(index, "item")
+
+    if required:
+        missing = [f for f in REQUIRED_OFFER_ITEM_FIELDS if item.get(f) in (None, "")]
+        if missing:
+            return _missing_fields_error([f"items[{index}].{f}" for f in missing])
+
+    if "service_variant_id" in item and not isinstance(item["service_variant_id"], int):
+        return _invalid_offer_item_error(index, "service_variant_id")
+
+    if "offer_price_syp" in item:
+        try:
+            price = float(item["offer_price_syp"])
+        except (TypeError, ValueError):
+            return _invalid_offer_item_error(index, "offer_price_syp")
+        if price < 0:
+            return _invalid_offer_item_error(index, "offer_price_syp")
+
+    return None
+
+
+def _serialize_offer_item(item):
+    v = item.service_variant
+    return {
+        "id": item.id,
+        "service_variant_id": item.service_variant_id,
+        "offer_price_syp": str(item.offer_price_syp),
+        "service_variant": {
+            "id": v.id,
+            "brand_name_ar": v.brand_name_ar,
+            "brand_name_en": v.brand_name_en,
+            "price_usd": str(v.price_usd),
+            "service_id": v.service_id,
+            "service_name_ar": v.service.name_ar,
+            "service_name_en": v.service.name_en,
+        },
+    }
+
+
+def _serialize_offer(o):
+    return {
+        "id": o.id,
+        "title_ar": o.title_ar,
+        "title_en": o.title_en,
+        "start_date": o.start_date.isoformat(),
+        "end_date": o.end_date.isoformat(),
+        "is_active": o.is_active,
+        "created_by": o.created_by,
+        "items": [_serialize_offer_item(i) for i in o.items],
     }
 
 
@@ -940,3 +1069,240 @@ def delete_doctor(doctor_id):
         db.session.commit()
 
     return jsonify(_serialize_doctor(doctor))
+
+
+def _offer_query():
+    return Offer.query.options(
+        joinedload(Offer.items).joinedload(OfferItem.service_variant).joinedload(ServiceVariant.service)
+    )
+
+
+@admin_bp.route("/api/admin/offers")
+@require_role("manager")
+def get_offers():
+    query = _offer_query()
+
+    is_active = request.args.get("is_active")
+    if is_active is not None:
+        query = query.filter(Offer.is_active == (is_active.lower() == "true"))
+
+    offers = query.order_by(Offer.id.asc()).all()
+
+    return jsonify([_serialize_offer(o) for o in offers])
+
+
+@admin_bp.route("/api/admin/offers", methods=["POST"])
+@require_role("manager")
+def create_offer():
+    data = request.get_json(silent=True) or {}
+
+    missing = [f for f in REQUIRED_OFFER_FIELDS if data.get(f) in (None, "")]
+    if missing:
+        return jsonify(_missing_fields_error(missing)), 400
+
+    title_ar = _clean_name(data["title_ar"])
+    if title_ar is None:
+        return jsonify(_invalid_field_error("title_ar")), 400
+
+    title_en = _clean_name(data["title_en"])
+    if title_en is None:
+        return jsonify(_invalid_field_error("title_en")), 400
+
+    start_date = _parse_date(data["start_date"])
+    if start_date is None:
+        return jsonify(_invalid_field_error("start_date")), 400
+
+    end_date = _parse_date(data["end_date"])
+    if end_date is None:
+        return jsonify(_invalid_field_error("end_date")), 400
+
+    if start_date > end_date:
+        return jsonify(_invalid_date_range_error()), 400
+
+    if "is_active" in data and data["is_active"] is not None \
+            and not isinstance(data["is_active"], bool):
+        return jsonify(_invalid_field_error("is_active")), 400
+
+    items_data = data["items"]
+    if not isinstance(items_data, list) or not items_data:
+        return jsonify(_invalid_field_error("items")), 400
+
+    seen_variant_ids = set()
+    for i, item in enumerate(items_data):
+        error = _validate_offer_item_payload(item, i, required=True)
+        if error:
+            return jsonify(error), 400
+        variant_id = item["service_variant_id"]
+        if variant_id in seen_variant_ids:
+            return jsonify(_duplicate_offer_item_error(variant_id)), 400
+        seen_variant_ids.add(variant_id)
+
+    found_variant_ids = {
+        v.id for v in ServiceVariant.query.filter(ServiceVariant.id.in_(seen_variant_ids)).all()
+    }
+    missing_variant_ids = seen_variant_ids - found_variant_ids
+    if missing_variant_ids:
+        for i, item in enumerate(items_data):
+            if item["service_variant_id"] in missing_variant_ids:
+                return jsonify(_offer_item_variant_not_found_error(i, item["service_variant_id"])), 400
+
+    offer = Offer(
+        title_ar=title_ar,
+        title_en=title_en,
+        start_date=start_date,
+        end_date=end_date,
+        is_active=data.get("is_active", True),
+        created_by=g.current_user["id"],
+    )
+    db.session.add(offer)
+    db.session.flush()  # assigns offer.id, still inside the same transaction
+
+    for item in items_data:
+        db.session.add(OfferItem(
+            offer_id=offer.id,
+            service_variant_id=item["service_variant_id"],
+            offer_price_syp=float(item["offer_price_syp"]),
+        ))
+
+    db.session.commit()
+
+    offer = _offer_query().get(offer.id)
+    return jsonify(_serialize_offer(offer)), 201
+
+
+@admin_bp.route("/api/admin/offers/<int:offer_id>", methods=["PUT"])
+@require_role("manager")
+def update_offer(offer_id):
+    offer = _offer_query().get(offer_id)
+    if not offer:
+        return jsonify(OFFER_NOT_FOUND_ERROR), 404
+
+    data = request.get_json(silent=True) or {}
+    fields_present = EDITABLE_OFFER_FIELDS & data.keys()
+    items_data = data.get("items")
+
+    if not fields_present and items_data is None:
+        return jsonify(NO_RECOGNIZED_FIELDS_ERROR), 400
+
+    new_title_ar = None
+    if "title_ar" in fields_present:
+        new_title_ar = _clean_name(data["title_ar"])
+        if new_title_ar is None:
+            return jsonify(_invalid_field_error("title_ar")), 400
+
+    new_title_en = None
+    if "title_en" in fields_present:
+        new_title_en = _clean_name(data["title_en"])
+        if new_title_en is None:
+            return jsonify(_invalid_field_error("title_en")), 400
+
+    new_start_date = offer.start_date
+    if "start_date" in fields_present:
+        new_start_date = _parse_date(data["start_date"])
+        if new_start_date is None:
+            return jsonify(_invalid_field_error("start_date")), 400
+
+    new_end_date = offer.end_date
+    if "end_date" in fields_present:
+        new_end_date = _parse_date(data["end_date"])
+        if new_end_date is None:
+            return jsonify(_invalid_field_error("end_date")), 400
+
+    if ("start_date" in fields_present or "end_date" in fields_present) \
+            and new_start_date > new_end_date:
+        return jsonify(_invalid_date_range_error()), 400
+
+    if "is_active" in fields_present and not isinstance(data["is_active"], bool):
+        return jsonify(_invalid_field_error("is_active")), 400
+
+    existing_items = {i.id: i for i in offer.items}
+    seen_variant_ids = set()
+    variant_ids_to_check = set()
+
+    if items_data is not None:
+        if not isinstance(items_data, list):
+            return jsonify(_invalid_field_error("items")), 400
+
+        for i, item in enumerate(items_data):
+            if not isinstance(item, dict):
+                return jsonify(_invalid_offer_item_error(i, "item")), 400
+
+            item_id = item.get("id")
+            if item_id is not None:
+                if item_id not in existing_items:
+                    return jsonify(_offer_item_not_found_error(item_id)), 404
+                error = _validate_offer_item_payload(item, i, required=False)
+            else:
+                error = _validate_offer_item_payload(item, i, required=True)
+            if error:
+                return jsonify(error), 400
+
+            variant_id = item.get("service_variant_id")
+            if variant_id is not None:
+                if variant_id in seen_variant_ids:
+                    return jsonify(_duplicate_offer_item_error(variant_id)), 400
+                seen_variant_ids.add(variant_id)
+                variant_ids_to_check.add(variant_id)
+
+        if variant_ids_to_check:
+            found = {
+                v.id for v in ServiceVariant.query.filter(ServiceVariant.id.in_(variant_ids_to_check)).all()
+            }
+            missing_ids = variant_ids_to_check - found
+            if missing_ids:
+                for i, item in enumerate(items_data):
+                    variant_id = item.get("service_variant_id")
+                    if variant_id in missing_ids:
+                        return jsonify(_offer_item_variant_not_found_error(i, variant_id)), 400
+
+    if new_title_ar is not None:
+        offer.title_ar = new_title_ar
+    if new_title_en is not None:
+        offer.title_en = new_title_en
+    if "start_date" in fields_present:
+        offer.start_date = new_start_date
+    if "end_date" in fields_present:
+        offer.end_date = new_end_date
+    if "is_active" in fields_present:
+        offer.is_active = data["is_active"]
+
+    # Existing items are only ever updated in place (matched by id) or
+    # appended to — an item is never removed here, since Appointment.
+    # offer_item_id may historically point at one.
+    if items_data is not None:
+        for item in items_data:
+            item_id = item.get("id")
+            if item_id is not None:
+                existing_item = existing_items[item_id]
+                if "service_variant_id" in item:
+                    existing_item.service_variant_id = item["service_variant_id"]
+                if "offer_price_syp" in item:
+                    existing_item.offer_price_syp = float(item["offer_price_syp"])
+            else:
+                db.session.add(OfferItem(
+                    offer_id=offer.id,
+                    service_variant_id=item["service_variant_id"],
+                    offer_price_syp=float(item["offer_price_syp"]),
+                ))
+
+    db.session.commit()
+
+    offer = _offer_query().get(offer.id)
+    return jsonify(_serialize_offer(offer))
+
+
+@admin_bp.route("/api/admin/offers/<int:offer_id>", methods=["DELETE"])
+@require_role("manager")
+def delete_offer(offer_id):
+    offer = Offer.query.get(offer_id)
+    if not offer:
+        return jsonify(OFFER_NOT_FOUND_ERROR), 404
+
+    # Soft-disable only — matches the existing is_active semantics already
+    # used elsewhere (see services.py's active-offer check) and preserves
+    # offer_items that historical Appointment rows may reference.
+    if offer.is_active:
+        offer.is_active = False
+        db.session.commit()
+
+    return jsonify(_serialize_offer(_offer_query().get(offer.id)))
