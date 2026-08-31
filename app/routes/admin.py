@@ -7,7 +7,8 @@ from werkzeug.security import check_password_hash
 from app.auth import generate_token, require_auth, require_role
 from app.extensions import db
 from app.models import (
-    AdminUser, Appointment, Category, Concern, Doctor, Offer, OfferItem, Service, ServiceVariant,
+    AdminUser, Appointment, Category, Concern, Doctor, ExchangeRate, Offer, OfferItem, Service,
+    ServiceVariant,
 )
 
 admin_bp = Blueprint("admin", __name__)
@@ -1306,3 +1307,45 @@ def delete_offer(offer_id):
         db.session.commit()
 
     return jsonify(_serialize_offer(_offer_query().get(offer.id)))
+
+
+def _serialize_exchange_rate(r):
+    return {
+        "id": r.id,
+        "rate": str(r.rate),
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        "updated_by": r.updated_by,
+    }
+
+
+@admin_bp.route("/api/admin/exchange-rate", methods=["PUT"])
+@require_role("manager")
+def update_exchange_rate():
+    data = request.get_json(silent=True) or {}
+
+    if data.get("rate") in (None, ""):
+        return jsonify(_missing_fields_error(["rate"])), 400
+
+    try:
+        rate_value = float(data["rate"])
+    except (TypeError, ValueError):
+        return jsonify(_invalid_field_error("rate")), 400
+
+    if rate_value <= 0:
+        return jsonify(_invalid_field_error("rate")), 400
+
+    # A single, currently-in-effect exchange rate — PUT updates it in place
+    # (updated_at/onupdate on the model handles the timestamp) rather than
+    # inserting a new row, since nothing references a specific ExchangeRate
+    # row (appointments freeze exchange_rate_at_booking as its own copy).
+    exchange_rate = ExchangeRate.query.order_by(ExchangeRate.updated_at.desc()).first()
+    if exchange_rate is None:
+        exchange_rate = ExchangeRate()
+        db.session.add(exchange_rate)
+
+    exchange_rate.rate = rate_value
+    exchange_rate.updated_by = g.current_user["id"]
+
+    db.session.commit()
+
+    return jsonify(_serialize_exchange_rate(exchange_rate))
