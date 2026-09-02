@@ -15,7 +15,9 @@ admin_bp = Blueprint("admin", __name__)
 
 VALID_STATUSES = {"pending", "confirmed", "rescheduled", "cancelled", "completed", "no_show"}
 VALID_REMINDER_CALL_STATUSES = {"not_called", "called_confirmed", "called_cancelled", "called_rescheduled"}
-PATCHABLE_APPOINTMENT_FIELDS = {"status", "confirmed_datetime", "reminder_call_status", "followup_sent"}
+PATCHABLE_APPOINTMENT_FIELDS = {
+    "status", "confirmed_datetime", "reminder_call_status", "followup_sent", "preferred_day",
+}
 
 REQUIRED_SERVICE_FIELDS = ["category_id", "name_ar", "name_en"]
 EDITABLE_SERVICE_FIELDS = {
@@ -253,6 +255,43 @@ def _validate_service_ids(raw):
     return services, None
 
 
+INVALID_CONCERN_ID_ERROR = {
+    "error": {
+        "code": "invalid_concern_id",
+        "message_ar": "معرّف مشكلة غير صالح",
+        "message_en": "Invalid concern id",
+    }
+}
+
+INVALID_DOCTOR_ID_ERROR = {
+    "error": {
+        "code": "invalid_doctor_id",
+        "message_ar": "معرّف طبيب غير صالح",
+        "message_en": "Invalid doctor id",
+    }
+}
+
+
+def _validate_related_ids(raw, model, field_name, unknown_id_error):
+    """Validates an id-list payload naming rows of `model` (e.g. the
+    `concern_ids` on a service). Returns (rows, error) — `error` is a
+    response dict (and `rows` is None) on failure, the matching rows (and
+    `error` is None) on success. `bool` is rejected explicitly since it is
+    a subclass of `int` and would otherwise pass as an id."""
+    if not isinstance(raw, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in raw
+    ):
+        return None, _invalid_field_error(field_name)
+
+    unique_ids = list(dict.fromkeys(raw))
+    rows = model.query.filter(model.id.in_(unique_ids)).all() if unique_ids else []
+
+    if len(rows) != len(unique_ids):
+        return None, unknown_id_error
+
+    return rows, None
+
+
 def _serialize_doctor(d):
     return {
         "id": d.id,
@@ -415,6 +454,16 @@ def _serialize_service(s):
         "duration_estimate": s.duration_estimate,
         "is_available": s.is_available,
         "variants": [_serialize_service_variant(v) for v in s.variants],
+        # Sorted by id so a caller can compare two responses without having
+        # to account for association-table ordering.
+        "concerns": [
+            {"id": c.id, "name_ar": c.name_ar, "name_en": c.name_en}
+            for c in sorted(s.concerns, key=lambda c: c.id)
+        ],
+        "doctors": [
+            {"id": d.id, "name_ar": d.name_ar, "name_en": d.name_en}
+            for d in sorted(s.doctors, key=lambda d: d.id)
+        ],
     }
 
 
@@ -496,7 +545,7 @@ def _serialize_appointment_detail(a):
 
 @admin_bp.route("/api/admin/login", methods=["POST"])
 def login():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     username = data.get("username")
     password = data.get("password")
 
@@ -578,6 +627,12 @@ def update_appointment(appointment_id):
     if "reminder_call_status" in fields_present and data["reminder_call_status"] not in VALID_REMINDER_CALL_STATUSES:
         return jsonify(INVALID_REMINDER_CALL_STATUS_ERROR), 400
 
+    new_preferred_day = None
+    if "preferred_day" in fields_present:
+        new_preferred_day = _parse_date(data["preferred_day"])
+        if new_preferred_day is None:
+            return jsonify(_invalid_field_error("preferred_day")), 400
+
     if "status" in fields_present:
         new_status = data["status"]
         if new_status == "completed" and appointment.completed_at is None:
@@ -598,6 +653,9 @@ def update_appointment(appointment_id):
         appointment.followup_sent = followup_sent
         appointment.followup_sent_at = datetime.utcnow() if followup_sent else None
 
+    if "preferred_day" in fields_present:
+        appointment.preferred_day = new_preferred_day
+
     db.session.commit()
 
     return jsonify(_serialize_appointment_detail(appointment))
@@ -609,6 +667,8 @@ def get_services():
     query = Service.query.options(
         joinedload(Service.category),
         joinedload(Service.variants),
+        joinedload(Service.concerns),
+        joinedload(Service.doctors),
     )
 
     category_id = request.args.get("category_id", type=int)
@@ -657,6 +717,24 @@ def create_service():
         if error:
             return jsonify(error), 400
 
+    # Both relationships are resolved before anything is written, so an
+    # unknown id rejects the whole request rather than half-applying it.
+    concerns = None
+    if "concern_ids" in data:
+        concerns, error = _validate_related_ids(
+            data["concern_ids"], Concern, "concern_ids", INVALID_CONCERN_ID_ERROR
+        )
+        if error:
+            return jsonify(error), 400
+
+    doctors = None
+    if "doctor_ids" in data:
+        doctors, error = _validate_related_ids(
+            data["doctor_ids"], Doctor, "doctor_ids", INVALID_DOCTOR_ID_ERROR
+        )
+        if error:
+            return jsonify(error), 400
+
     service = Service(
         category_id=data["category_id"],
         name_ar=data["name_ar"],
@@ -666,6 +744,10 @@ def create_service():
         duration_estimate=data.get("duration_estimate"),
         is_available=data.get("is_available", True),
     )
+    if concerns is not None:
+        service.concerns = concerns
+    if doctors is not None:
+        service.doctors = doctors
     db.session.add(service)
     db.session.flush()  # assigns service.id, still inside the same transaction
 
@@ -689,6 +771,8 @@ def update_service(service_id):
     service = Service.query.options(
         joinedload(Service.category),
         joinedload(Service.variants),
+        joinedload(Service.concerns),
+        joinedload(Service.doctors),
     ).get(service_id)
     if not service:
         return jsonify(SERVICE_NOT_FOUND_ERROR), 404
@@ -696,8 +780,13 @@ def update_service(service_id):
     data = request.get_json(silent=True) or {}
     fields_present = EDITABLE_SERVICE_FIELDS & data.keys()
     variants_data = data.get("variants")
+    # Presence, not truthiness — [] is a meaningful value here, meaning
+    # "unlink everything", while an absent key leaves the link untouched.
+    concern_ids_present = "concern_ids" in data
+    doctor_ids_present = "doctor_ids" in data
 
-    if not fields_present and variants_data is None:
+    if not fields_present and variants_data is None \
+            and not concern_ids_present and not doctor_ids_present:
         return jsonify(NO_RECOGNIZED_FIELDS_ERROR), 400
 
     if "category_id" in fields_present:
@@ -735,10 +824,35 @@ def update_service(service_id):
             if error:
                 return jsonify(error), 400
 
+    # Resolved before any field is written so an unknown id rejects the
+    # whole request instead of leaving a half-applied update behind.
+    concerns = None
+    if concern_ids_present:
+        concerns, error = _validate_related_ids(
+            data["concern_ids"], Concern, "concern_ids", INVALID_CONCERN_ID_ERROR
+        )
+        if error:
+            return jsonify(error), 400
+
+    doctors = None
+    if doctor_ids_present:
+        doctors, error = _validate_related_ids(
+            data["doctor_ids"], Doctor, "doctor_ids", INVALID_DOCTOR_ID_ERROR
+        )
+        if error:
+            return jsonify(error), 400
+
     for field in ("name_ar", "name_en", "description_ar", "description_en",
                   "duration_estimate", "is_available", "category_id"):
         if field in fields_present:
             setattr(service, field, data[field])
+
+    # Assigning the full list replaces the association rows outright, so a
+    # shorter list really does unlink the ones left out.
+    if concerns is not None:
+        service.concerns = concerns
+    if doctors is not None:
+        service.doctors = doctors
 
     if variants_data is not None:
         existing_variants = {v.id: v for v in service.variants}

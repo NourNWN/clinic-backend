@@ -1,6 +1,6 @@
 from datetime import date
 from flask import Blueprint, jsonify, request
-from app.models import Category, Concern, Doctor, Service, ExchangeRate
+from app.models import Category, Concern, Doctor, Service, ServiceVariant, ExchangeRate
 
 services_bp = Blueprint("services", __name__)
 
@@ -52,7 +52,13 @@ def get_services():
     category_id = request.args.get("category_id", type=int)
     concern_id = request.args.get("concern_id", type=int)
 
-    query = Service.query.filter(Service.is_available.is_(True))
+    # A service with no bookable brand left is hidden from the public site
+    # entirely — showing it would offer a treatment with nothing to pick.
+    # The flags stay independent; this is only about what gets exposed.
+    query = Service.query.filter(
+        Service.is_available.is_(True),
+        Service.variants.any(ServiceVariant.is_available.is_(True)),
+    )
     if category_id:
         query = query.filter(Service.category_id == category_id)
     if concern_id:
@@ -94,7 +100,12 @@ def get_services():
 @services_bp.route("/api/services/<int:service_id>")
 def get_service_detail(service_id):
     service = Service.query.get(service_id)
-    if not service or not service.is_available:
+
+    # Same 404 whether the service doesn't exist, is hidden, or has no
+    # available brands left — the public API doesn't distinguish between
+    # them, so nothing leaks about services that exist but aren't bookable.
+    has_available_variant = service and any(v.is_available for v in service.variants)
+    if not service or not service.is_available or not has_available_variant:
         return jsonify({
             "error": {
                 "code": "service_not_found",
