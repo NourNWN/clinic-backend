@@ -3,6 +3,9 @@ from datetime import date, timedelta
 
 import jwt
 import pytest
+from flask import current_app
+
+from app.auth import _authenticate
 
 from app.extensions import db
 from app.models import (
@@ -95,7 +98,7 @@ class TestAuthGuard:
 
     def test_wrong_signature_401(self, client, app, manager_user):
         bad_token = jwt.encode(
-            {"sub": manager_user.id, "role": "manager"}, "wrong-secret", algorithm="HS256"
+            {"sub": str(manager_user.id), "role": "manager"}, "wrong-secret", algorithm="HS256"
         )
         r = client.get(self.PROTECTED_GET, headers={"Authorization": f"Bearer {bad_token}"})
         assert r.status_code == 401
@@ -104,7 +107,7 @@ class TestAuthGuard:
         import datetime as dt
         now = dt.datetime.now(dt.timezone.utc)
         expired = jwt.encode(
-            {"sub": manager_user.id, "role": "manager", "iat": now - dt.timedelta(hours=9),
+            {"sub": str(manager_user.id), "role": "manager", "iat": now - dt.timedelta(hours=9),
              "exp": now - dt.timedelta(hours=1)},
             app.config["SECRET_KEY"], algorithm="HS256",
         )
@@ -115,11 +118,34 @@ class TestAuthGuard:
         import base64, json as _json
         header = base64.urlsafe_b64encode(_json.dumps({"alg": "none", "typ": "JWT"}).encode()).rstrip(b"=").decode()
         payload = base64.urlsafe_b64encode(
-            _json.dumps({"sub": manager_user.id, "role": "manager"}).encode()
+            _json.dumps({"sub": str(manager_user.id), "role": "manager"}).encode()
         ).rstrip(b"=").decode()
         forged = f"{header}.{payload}."
         r = client.get(self.PROTECTED_GET, headers={"Authorization": f"Bearer {forged}"})
         assert r.status_code == 401
+
+    def test_issued_token_carries_sub_as_a_string(self, client, manager_user, manager_token):
+        """Regression: `sub` used to be encoded as the raw integer user id.
+        PyJWT enforces RFC 7519's string-`sub` rule on decode from 2.10 on
+        (InvalidSubjectError), so the app issued tokens at login that it then
+        rejected with 401 on every protected route -- but only when running
+        against PyJWT >= 2.10, which is why the pinned dev env never saw it."""
+        claims = jwt.decode(
+            manager_token, current_app.config["SECRET_KEY"], algorithms=["HS256"]
+        )
+        assert claims["sub"] == str(manager_user.id)
+        assert isinstance(claims["sub"], str)
+
+    def test_authenticated_route_sees_integer_user_id(self, client, manager_user, manager_token):
+        """`sub` travels as a string, but g.current_user["id"] must stay an
+        int -- it is written straight into integer FKs (created_by/updated_by)."""
+        with client.application.test_request_context(
+            headers={"Authorization": f"Bearer {manager_token}"}
+        ):
+            user, error = _authenticate()
+        assert error is None
+        assert user == {"id": manager_user.id, "role": "manager"}
+        assert isinstance(user["id"], int)
 
     def test_valid_token_reception_allowed_on_require_auth_route(self, client, reception_token):
         r = client.get(self.PROTECTED_GET, headers=auth_headers(reception_token))
