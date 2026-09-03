@@ -369,6 +369,17 @@ def _parse_date(value):
         return None
 
 
+def _parse_datetime(value):
+    """An ISO datetime string -> `datetime`, or None if it isn't one. Accepts
+    a trailing `Z`, which `fromisoformat` doesn't handle before Python 3.11."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _validate_offer_item_payload(item, index, *, required):
     """Validate a single offer-item dict from the request body.
     Returns an error dict, or None if valid."""
@@ -391,6 +402,9 @@ def _validate_offer_item_payload(item, index, *, required):
         if price < 0:
             return _invalid_offer_item_error(index, "offer_price_syp")
 
+    if "is_active" in item and not isinstance(item["is_active"], bool):
+        return _invalid_offer_item_error(index, "is_active")
+
     return None
 
 
@@ -400,6 +414,7 @@ def _serialize_offer_item(item):
         "id": item.id,
         "service_variant_id": item.service_variant_id,
         "offer_price_syp": str(item.offer_price_syp),
+        "is_active": item.is_active,
         "service_variant": {
             "id": v.id,
             "brand_name_ar": v.brand_name_ar,
@@ -582,9 +597,16 @@ def get_appointments():
         joinedload(Appointment.doctor),
     )
 
+    # Parsed rather than passed straight through: an unparseable value reaches
+    # PostgreSQL as a date literal and comes back as a DataError — an HTML 500,
+    # not the JSON envelope. SQLite accepts it silently, so the tests were
+    # blind to this.
     day = request.args.get("day")
     if day:
-        query = query.filter(Appointment.preferred_day == day)
+        parsed_day = _parse_date(day)
+        if parsed_day is None:
+            return jsonify(_invalid_field_error("day")), 400
+        query = query.filter(Appointment.preferred_day == parsed_day)
 
     status = request.args.get("status")
     if status:
@@ -595,7 +617,11 @@ def get_appointments():
         query = query.filter(Appointment.reminder_call_status == reminder_call_status)
 
     if request.args.get("needs_followup") == "true":
-        seven_days_ago = date.today() - timedelta(days=7)
+        # completed_at is written with datetime.utcnow(), so the cutoff has to
+        # be UTC too. Computing it from the server's local date meant that for
+        # any clinic east of UTC the filter looked at the wrong day for the
+        # first hours after local midnight, and those follow-ups were missed.
+        seven_days_ago = datetime.utcnow().date() - timedelta(days=7)
         query = query.filter(
             Appointment.status == "completed",
             db.func.date(Appointment.completed_at) == seven_days_ago,
@@ -636,6 +662,16 @@ def update_appointment(appointment_id):
         if new_preferred_day is None:
             return jsonify(_invalid_field_error("preferred_day")), 400
 
+    # Parsed before any write, like every other field here: this used to be
+    # converted inline at assignment time, where a malformed string or a
+    # non-string raised straight out of the handler as a 500 instead of the
+    # JSON error envelope the rest of the API returns.
+    new_confirmed_datetime = None
+    if "confirmed_datetime" in fields_present and data["confirmed_datetime"]:
+        new_confirmed_datetime = _parse_datetime(data["confirmed_datetime"])
+        if new_confirmed_datetime is None:
+            return jsonify(_invalid_field_error("confirmed_datetime")), 400
+
     if "status" in fields_present:
         new_status = data["status"]
         if new_status == "completed" and appointment.completed_at is None:
@@ -643,10 +679,7 @@ def update_appointment(appointment_id):
         appointment.status = new_status
 
     if "confirmed_datetime" in fields_present:
-        raw = data["confirmed_datetime"]
-        appointment.confirmed_datetime = (
-            datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
-        )
+        appointment.confirmed_datetime = new_confirmed_datetime
 
     if "reminder_call_status" in fields_present:
         appointment.reminder_call_status = data["reminder_call_status"]
@@ -688,7 +721,7 @@ def get_services():
 
 
 @admin_bp.route("/api/admin/services", methods=["POST"])
-@require_auth
+@require_role("manager")
 def create_service():
     data = request.get_json(silent=True) or {}
 
@@ -769,7 +802,7 @@ def create_service():
 
 
 @admin_bp.route("/api/admin/services/<int:service_id>", methods=["PUT"])
-@require_auth
+@require_role("manager")
 def update_service(service_id):
     service = Service.query.options(
         joinedload(Service.category),
@@ -878,7 +911,7 @@ def update_service(service_id):
 
 
 @admin_bp.route("/api/admin/services/<int:service_id>", methods=["DELETE"])
-@require_auth
+@require_role("manager")
 def delete_service(service_id):
     service = Service.query.get(service_id)
     if not service:
@@ -901,7 +934,7 @@ def get_categories():
 
 
 @admin_bp.route("/api/admin/categories", methods=["POST"])
-@require_auth
+@require_role("manager")
 def create_category():
     data = request.get_json(silent=True) or {}
 
@@ -929,7 +962,7 @@ def create_category():
 
 
 @admin_bp.route("/api/admin/categories/<int:category_id>", methods=["PUT"])
-@require_auth
+@require_role("manager")
 def update_category(category_id):
     category = Category.query.get(category_id)
     if not category:
@@ -978,7 +1011,7 @@ def get_concerns():
 
 
 @admin_bp.route("/api/admin/concerns", methods=["POST"])
-@require_auth
+@require_role("manager")
 def create_concern():
     data = request.get_json(silent=True) or {}
 
@@ -1015,7 +1048,7 @@ def create_concern():
 
 
 @admin_bp.route("/api/admin/concerns/<int:concern_id>", methods=["PUT"])
-@require_auth
+@require_role("manager")
 def update_concern(concern_id):
     concern = Concern.query.get(concern_id)
     if not concern:
@@ -1076,7 +1109,7 @@ def get_doctors():
 
 
 @admin_bp.route("/api/admin/doctors", methods=["POST"])
-@require_auth
+@require_role("manager")
 def create_doctor():
     data = request.get_json(silent=True) or {}
 
@@ -1124,7 +1157,7 @@ def create_doctor():
 
 
 @admin_bp.route("/api/admin/doctors/<int:doctor_id>", methods=["PUT"])
-@require_auth
+@require_role("manager")
 def update_doctor(doctor_id):
     doctor = Doctor.query.options(joinedload(Doctor.services)).get(doctor_id)
     if not doctor:
@@ -1173,7 +1206,7 @@ def update_doctor(doctor_id):
 
 
 @admin_bp.route("/api/admin/doctors/<int:doctor_id>", methods=["DELETE"])
-@require_auth
+@require_role("manager")
 def delete_doctor(doctor_id):
     doctor = Doctor.query.get(doctor_id)
     if not doctor:
@@ -1280,6 +1313,7 @@ def create_offer():
             offer_id=offer.id,
             service_variant_id=item["service_variant_id"],
             offer_price_syp=float(item["offer_price_syp"]),
+            is_active=item.get("is_active", True),
         ))
 
     db.session.commit()
@@ -1355,12 +1389,20 @@ def update_offer(offer_id):
             if error:
                 return jsonify(error), 400
 
+            # An item that names no variant keeps the one it already has, so
+            # the duplicate check has to compare the *effective* variant of
+            # every entry — otherwise {"id": 5} and the variant id 5 already
+            # points at could both end up active on the same offer.
             variant_id = item.get("service_variant_id")
+            if variant_id is not None:
+                variant_ids_to_check.add(variant_id)
+            elif item_id is not None:
+                variant_id = existing_items[item_id].service_variant_id
+
             if variant_id is not None:
                 if variant_id in seen_variant_ids:
                     return jsonify(_duplicate_offer_item_error(variant_id)), 400
                 seen_variant_ids.add(variant_id)
-                variant_ids_to_check.add(variant_id)
 
         if variant_ids_to_check:
             found = {
@@ -1384,24 +1426,45 @@ def update_offer(offer_id):
     if "is_active" in fields_present:
         offer.is_active = data["is_active"]
 
-    # Existing items are only ever updated in place (matched by id) or
-    # appended to — an item is never removed here, since Appointment.
-    # offer_item_id may historically point at one.
+    # `items` is the offer's complete intended set of live brands: entries
+    # are updated in place or added, and anything left out is deactivated.
+    # Rows are never deleted — Appointment.offer_item_id may point at one,
+    # and the price frozen on that booking has to stay resolvable.
     if items_data is not None:
+        by_variant = {i.service_variant_id: i for i in offer.items}
+        touched_ids = set()
+
         for item in items_data:
             item_id = item.get("id")
             if item_id is not None:
                 existing_item = existing_items[item_id]
-                if "service_variant_id" in item:
-                    existing_item.service_variant_id = item["service_variant_id"]
-                if "offer_price_syp" in item:
-                    existing_item.offer_price_syp = float(item["offer_price_syp"])
             else:
+                # Re-adding a brand that was removed earlier revives its
+                # original row instead of opening a second one for the same
+                # variant, which would leave the offer with a duplicate.
+                existing_item = by_variant.get(item["service_variant_id"])
+
+            if existing_item is None:
                 db.session.add(OfferItem(
                     offer_id=offer.id,
                     service_variant_id=item["service_variant_id"],
                     offer_price_syp=float(item["offer_price_syp"]),
+                    is_active=item.get("is_active", True),
                 ))
+                continue
+
+            if "service_variant_id" in item:
+                existing_item.service_variant_id = item["service_variant_id"]
+            if "offer_price_syp" in item:
+                existing_item.offer_price_syp = float(item["offer_price_syp"])
+            # Naming an item in `items` is what marks it live, so re-adding a
+            # removed brand needs no special flag from the caller.
+            existing_item.is_active = item.get("is_active", True)
+            touched_ids.add(existing_item.id)
+
+        for existing_item in offer.items:
+            if existing_item.id not in touched_ids:
+                existing_item.is_active = False
 
     db.session.commit()
 

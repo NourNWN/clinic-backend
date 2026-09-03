@@ -21,6 +21,15 @@ def exchange_rate(app):
     return rate
 
 
+@pytest.fixture(autouse=True)
+def _doctor_provides_the_service(service, doctor):
+    """Booking requires a doctor who actually provides the treatment, so every
+    test here starts from that state — otherwise the doctor/service guard
+    rejects the request before the behaviour under test is reached."""
+    service.doctors = [doctor]
+    db.session.commit()
+
+
 def _payload(variant, doctor, **overrides):
     body = {
         "patient_name": "سارة",
@@ -140,6 +149,107 @@ class TestMalformedValuesAreRejected:
         assert Appointment.query.count() == 0
 
 
+class TestPatientFieldLimits:
+    """`patient_name` and `patient_phone` are varchar(150)/varchar(20).
+
+    An over-long or non-string value used to travel all the way to the driver
+    and fail there as a psycopg2 DataError — an HTML 500 instead of the JSON
+    envelope. SQLite ignores both constraints, so these cases pass silently on
+    the test database and only break against PostgreSQL; that is exactly the
+    gap these tests exist to close.
+    """
+
+    def test_over_long_name_is_rejected(self, client, variant, doctor, exchange_rate):
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, patient_name="x" * 151)
+        )
+        _assert_validation_error(r)
+        assert Appointment.query.count() == 0
+
+    def test_over_long_phone_is_rejected(self, client, variant, doctor, exchange_rate):
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, patient_phone="9" * 21)
+        )
+        _assert_validation_error(r)
+        assert Appointment.query.count() == 0
+
+    def test_name_at_the_limit_is_accepted(self, client, variant, doctor, exchange_rate):
+        """The boundary itself must still fit — 150 is a legal name."""
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, patient_name="x" * 150)
+        )
+        assert r.status_code == 201
+
+    @pytest.mark.parametrize(
+        "bad", [12345, 1.5, True, [], {}],
+        ids=["int", "float", "bool", "list", "dict"],
+    )
+    @pytest.mark.parametrize("field", ["patient_name", "patient_phone"])
+    def test_non_string_values_are_rejected(
+        self, client, variant, doctor, exchange_rate, field, bad
+    ):
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, **{field: bad})
+        )
+        _assert_validation_error(r)
+
+    @pytest.mark.parametrize("field", ["patient_name", "patient_phone"])
+    def test_whitespace_only_is_rejected(
+        self, client, variant, doctor, exchange_rate, field
+    ):
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, **{field: "   "})
+        )
+        _assert_validation_error(r)
+
+    def test_surrounding_whitespace_is_trimmed(self, client, variant, doctor, exchange_rate):
+        r = client.post(
+            "/api/appointments",
+            json=_payload(variant, doctor, patient_name="  سارة  ", patient_phone=" +963900000000 "),
+        )
+        assert r.status_code == 201
+        stored = Appointment.query.one()
+        assert stored.patient_name == "سارة"
+        assert stored.patient_phone == "+963900000000"
+
+
+class TestPreferredDayIsNotInThePast:
+    """The booking form sets `min={today}`, so this rule lived only in the
+    browser. Anything not going through that form could file a booking into
+    the past, where it sorts to the top of the admin list."""
+
+    def test_yesterday_is_rejected(self, client, variant, doctor, exchange_rate):
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, preferred_day=yesterday)
+        )
+        assert r.status_code == 400
+        assert r.is_json
+        error = r.get_json()["error"]
+        assert error["code"] == "preferred_day_in_past"
+        assert error["message_ar"] and error["message_en"]
+        assert Appointment.query.count() == 0
+
+    def test_long_past_is_rejected(self, client, variant, doctor, exchange_rate):
+        r = client.post(
+            "/api/appointments", json=_payload(variant, doctor, preferred_day="2020-01-01")
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "preferred_day_in_past"
+
+    def test_today_is_still_allowed(self, client, variant, doctor, exchange_rate):
+        """A same-day request is a normal walk-in, not a past booking."""
+        r = client.post(
+            "/api/appointments",
+            json=_payload(variant, doctor, preferred_day=date.today().isoformat()),
+        )
+        assert r.status_code == 201
+
+    def test_future_is_still_allowed(self, client, variant, doctor, exchange_rate):
+        r = client.post("/api/appointments", json=_payload(variant, doctor))
+        assert r.status_code == 201
+
+
 class TestMissingAndUnknownReferences:
     @pytest.mark.parametrize(
         "field",
@@ -187,3 +297,68 @@ class TestMissingAndUnknownReferences:
         r = client.post("/api/appointments", json=_payload(variant, doctor))
         assert r.status_code == 503
         assert r.get_json()["error"]["code"] == "no_exchange_rate"
+
+
+class TestAvailabilityGuards:
+    """What the clinic has withdrawn must not keep taking bookings.
+
+    The public site already hides all of these, so anything reaching the API
+    in these states came from outside the booking form — a stale tab, a
+    replayed request, or a script. Each was accepted before.
+    """
+
+    def _assert_rejected(self, response, code):
+        assert response.status_code == 400
+        assert response.content_type.startswith("application/json")
+        error = response.get_json()["error"]
+        assert error["code"] == code
+        assert error["message_ar"] and error["message_en"]
+
+    def test_variant_of_a_disabled_service_is_rejected(
+        self, client, variant, doctor, service, exchange_rate
+    ):
+        """Soft-deleting a service only clears Service.is_available and leaves
+        each variant's own flag alone, so a check on the variant by itself let
+        a withdrawn treatment stay bookable."""
+        service.is_available = False
+        db.session.commit()
+
+        r = client.post("/api/appointments", json=_payload(variant, doctor))
+        self._assert_rejected(r, "invalid_variant")
+        assert Appointment.query.count() == 0
+
+    def test_unavailable_doctor_is_rejected(self, client, variant, doctor, exchange_rate):
+        doctor.is_available = False
+        db.session.commit()
+
+        r = client.post("/api/appointments", json=_payload(variant, doctor))
+        self._assert_rejected(r, "doctor_not_available")
+        assert Appointment.query.count() == 0
+
+    def test_doctor_not_linked_to_the_service_is_rejected(
+        self, client, variant, doctor, service, exchange_rate
+    ):
+        """The public service page builds its practitioner list from
+        doctor_services, so an unlinked pairing can't come from that flow."""
+        service.doctors = []
+        db.session.commit()
+
+        r = client.post("/api/appointments", json=_payload(variant, doctor))
+        self._assert_rejected(r, "doctor_not_available_for_service")
+        assert Appointment.query.count() == 0
+
+    def test_a_fully_available_booking_still_succeeds(
+        self, client, variant, doctor, exchange_rate
+    ):
+        """The guards must not narrow the healthy path."""
+        r = client.post("/api/appointments", json=_payload(variant, doctor))
+        assert r.status_code == 201
+        assert Appointment.query.count() == 1
+
+    def test_disabled_variant_still_rejected(self, client, variant, doctor, exchange_rate):
+        """The original check, retained alongside the new service-level one."""
+        variant.is_available = False
+        db.session.commit()
+
+        r = client.post("/api/appointments", json=_payload(variant, doctor))
+        self._assert_rejected(r, "invalid_variant")
