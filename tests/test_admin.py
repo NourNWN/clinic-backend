@@ -193,6 +193,62 @@ class TestAppointments:
         assert len(body) == 1
         assert body[0]["id"] == completed.id
 
+    def test_list_rows_carry_every_field_the_admin_screen_filters_on(
+        self, client, reception_token, appointment
+    ):
+        """The appointments screen re-filters each tab client-side after a
+        PATCH, reading `reminder_call_status` and `followup_sent` straight off
+        the list rows. A row that omits either can only be filtered by
+        accident, so the list serializer has to carry both."""
+        r = client.get("/api/admin/appointments", headers=auth_headers(reception_token))
+        item = r.get_json()[0]
+
+        assert item["reminder_call_status"] == "not_called"
+        assert item["followup_sent"] is False
+
+    def test_list_followup_sent_reflects_a_sent_followup(
+        self, client, reception_token, appointment
+    ):
+        appointment.followup_sent = True
+        db.session.commit()
+
+        r = client.get("/api/admin/appointments", headers=auth_headers(reception_token))
+        assert r.get_json()[0]["followup_sent"] is True
+
+    def test_needs_followup_rows_are_all_unsent(self, client, reception_token, app, variant, doctor):
+        """Every row the follow-up filter returns must report followup_sent
+        false explicitly — the screen's `!a.followup_sent` check has to be
+        reading a real boolean, not an absent key."""
+        from datetime import datetime
+        completed = Appointment(
+            patient_name="Old Patient", patient_phone="+963900000001",
+            service_variant_id=variant.id, doctor_id=doctor.id,
+            preferred_day=date.today() - timedelta(days=10),
+            status="completed",
+            completed_at=datetime.utcnow() - timedelta(days=7),
+            followup_sent=False,
+            final_price_syp_at_booking=1000000, exchange_rate_at_booking=14500,
+        )
+        db.session.add(completed)
+        db.session.commit()
+
+        r = client.get("/api/admin/appointments?needs_followup=true", headers=auth_headers(reception_token))
+        assert [row["followup_sent"] for row in r.get_json()] == [False]
+
+    def test_patch_response_still_carries_the_full_detail_shape(
+        self, client, reception_token, appointment
+    ):
+        """followup_sent moved onto the base serializer; the PATCH response
+        must still expose it alongside the detail-only timestamps."""
+        r = client.patch(
+            f"/api/admin/appointments/{appointment.id}",
+            json={"status": "confirmed"},
+            headers=auth_headers(reception_token),
+        )
+        body = r.get_json()
+        for field in ("followup_sent", "followup_sent_at", "confirmed_datetime", "completed_at"):
+            assert field in body, f"{field} missing from PATCH response"
+
     def test_update_status_to_completed_sets_completed_at(self, client, reception_token, appointment):
         r = client.patch(
             f"/api/admin/appointments/{appointment.id}",

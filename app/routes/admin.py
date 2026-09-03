@@ -525,6 +525,10 @@ def _serialize_appointment(a):
         "preferred_day": a.preferred_day.isoformat(),
         "status": a.status,
         "reminder_call_status": a.reminder_call_status,
+        # Both call/follow-up flags belong on the list rows: the appointments
+        # screen filters its "calls" and "follow-up" tabs on them client-side,
+        # so a row that omits one can only be filtered by accident.
+        "followup_sent": a.followup_sent,
         "final_price_syp_at_booking": str(a.final_price_syp_at_booking),
         "created_at": a.created_at.isoformat(),
     }
@@ -536,7 +540,6 @@ def _serialize_appointment_detail(a):
     data = _serialize_appointment(a)
     data.update({
         "confirmed_datetime": a.confirmed_datetime.isoformat() if a.confirmed_datetime else None,
-        "followup_sent": a.followup_sent,
         "followup_sent_at": a.followup_sent_at.isoformat() if a.followup_sent_at else None,
         "completed_at": a.completed_at.isoformat() if a.completed_at else None,
     })
