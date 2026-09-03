@@ -113,6 +113,28 @@ class TestAuthGuard:
         )
         r = client.get(self.PROTECTED_GET, headers={"Authorization": f"Bearer {expired}"})
         assert r.status_code == 401
+        # Its own code, so the client can send the user straight back to the
+        # login screen instead of guessing why the call was rejected.
+        assert r.get_json()["error"]["code"] == "token_expired"
+
+    def test_expired_token_on_manager_route_reports_token_expired(self, client, app, manager_user):
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc)
+        expired = jwt.encode(
+            {"sub": str(manager_user.id), "role": "manager", "iat": now - dt.timedelta(hours=9),
+             "exp": now - dt.timedelta(hours=1)},
+            app.config["SECRET_KEY"], algorithm="HS256",
+        )
+        r = client.get(self.MANAGER_ONLY_GET, headers={"Authorization": f"Bearer {expired}"})
+        assert r.status_code == 401
+        assert r.get_json()["error"]["code"] == "token_expired"
+
+    def test_wrong_signature_is_unauthorized_not_token_expired(self, client, manager_user):
+        bad_token = jwt.encode(
+            {"sub": str(manager_user.id), "role": "manager"}, "wrong-secret", algorithm="HS256"
+        )
+        r = client.get(self.PROTECTED_GET, headers={"Authorization": f"Bearer {bad_token}"})
+        assert r.get_json()["error"]["code"] == "unauthorized"
 
     def test_none_algorithm_attack_rejected(self, client, manager_user):
         import base64, json as _json
@@ -200,6 +222,27 @@ class TestAppointments:
         r2 = client.get("/api/admin/appointments?day=2000-01-01", headers=auth_headers(reception_token))
         assert r2.get_json() == []
 
+    @pytest.mark.parametrize(
+        "bad_day", ["not-a-date", "2026-13-01", "01-09-2026", "' OR 1=1--", "2026-02-30"],
+        ids=["word", "month-13", "wrong-order", "sql-ish", "impossible-date"],
+    )
+    def test_unparseable_day_filter_is_rejected(self, client, reception_token, appointment, bad_day):
+        """Regression: this value was passed straight into the query, where
+        PostgreSQL rejected it as a DataError — an HTML 500 rather than the
+        JSON envelope. SQLite accepted it, so the suite never saw it."""
+        r = client.get(
+            f"/api/admin/appointments?day={bad_day}", headers=auth_headers(reception_token)
+        )
+        assert r.status_code == 400
+        assert r.is_json
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_empty_day_filter_is_ignored_not_rejected(self, client, reception_token, appointment):
+        """An absent filter is not an invalid one — `?day=` means unfiltered."""
+        r = client.get("/api/admin/appointments?day=", headers=auth_headers(reception_token))
+        assert r.status_code == 200
+        assert len(r.get_json()) == 1
+
     def test_filter_needs_followup(self, client, reception_token, app, variant, doctor):
         from datetime import datetime
         completed = Appointment(
@@ -260,6 +303,41 @@ class TestAppointments:
 
         r = client.get("/api/admin/appointments?needs_followup=true", headers=auth_headers(reception_token))
         assert [row["followup_sent"] for row in r.get_json()] == [False]
+
+    @pytest.mark.parametrize(
+        "days_ago, expected",
+        [(6, 0), (7, 1), (8, 0)],
+        ids=["six-days-ago", "seven-days-ago", "eight-days-ago"],
+    )
+    def test_needs_followup_matches_the_seventh_day_only(
+        self, client, reception_token, variant, doctor, days_ago, expected
+    ):
+        """The window is a single day, measured in UTC because that is what
+        completed_at is written in. Comparing against the server's *local*
+        date instead put the window on the wrong day for the first hours
+        after local midnight in any timezone ahead of UTC.
+
+        The narrowness itself is a known fragility — anything completed more
+        than seven days ago is never surfaced again — but it is the current
+        contract, so it is pinned here rather than left implicit.
+        """
+        from datetime import datetime
+        db.session.add(Appointment(
+            patient_name="Old Patient", patient_phone="+963900000001",
+            service_variant_id=variant.id, doctor_id=doctor.id,
+            preferred_day=date.today() - timedelta(days=days_ago + 3),
+            status="completed",
+            completed_at=datetime.utcnow() - timedelta(days=days_ago),
+            followup_sent=False,
+            final_price_syp_at_booking=1000000, exchange_rate_at_booking=14500,
+        ))
+        db.session.commit()
+
+        r = client.get(
+            "/api/admin/appointments?needs_followup=true",
+            headers=auth_headers(reception_token),
+        )
+        assert len(r.get_json()) == expected
 
     def test_patch_response_still_carries_the_full_detail_shape(
         self, client, reception_token, appointment
@@ -373,36 +451,165 @@ class TestAppointments:
         r2 = client.patch(f"/api/admin/appointments/{appointment.id}", json={"status": "confirmed"})
         assert r2.status_code == 401
 
+    def test_malformed_confirmed_datetime_is_rejected(self, client, reception_token, appointment):
+        """Regression: this value used to be parsed inline at assignment time,
+        so a malformed string raised ValueError straight out of the handler as
+        an HTML 500 instead of the bilingual envelope every other field
+        returns."""
+        r = client.patch(
+            f"/api/admin/appointments/{appointment.id}",
+            headers=auth_headers(reception_token),
+            json={"confirmed_datetime": "not-a-datetime"},
+        )
+        assert r.status_code == 400
+        assert r.is_json
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_non_string_confirmed_datetime_is_rejected(self, client, reception_token, appointment):
+        """Same path, the other way it used to blow up: a non-string raised
+        AttributeError on .replace()."""
+        r = client.patch(
+            f"/api/admin/appointments/{appointment.id}",
+            headers=auth_headers(reception_token),
+            json={"confirmed_datetime": 12345},
+        )
+        assert r.status_code == 400
+        assert r.is_json
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_bad_confirmed_datetime_leaves_the_row_untouched(
+        self, client, reception_token, appointment
+    ):
+        """Validation happens before any write, so a rejected request must not
+        have applied the other fields in the same payload."""
+        r = client.patch(
+            f"/api/admin/appointments/{appointment.id}",
+            headers=auth_headers(reception_token),
+            json={"status": "confirmed", "confirmed_datetime": "nope"},
+        )
+        assert r.status_code == 400
+        db.session.refresh(appointment)
+        assert appointment.status == "pending"
+        assert appointment.confirmed_datetime is None
+
+
+# ---------------------------------------------------------------------------
+# Role permissions
+# ---------------------------------------------------------------------------
+
+class TestRolePermissions:
+    """The reception/manager split, asserted as a matrix.
+
+    Reception runs the front desk: they read the catalogue and work the
+    appointment list. Managing what the clinic offers — and what it charges —
+    is the manager's. Catalogue writes were previously guarded only by
+    `require_auth`, which let a reception account reprice every brand.
+    """
+
+    RECEPTION_MAY_READ = [
+        "/api/admin/appointments",
+        "/api/admin/services",
+        "/api/admin/categories",
+        "/api/admin/concerns",
+        "/api/admin/doctors",
+    ]
+
+    @pytest.mark.parametrize("path", RECEPTION_MAY_READ)
+    def test_reception_can_still_read(self, client, reception_token, path):
+        r = client.get(path, headers=auth_headers(reception_token))
+        assert r.status_code == 200
+
+    def test_reception_can_still_work_appointments(self, client, reception_token, appointment):
+        r = client.patch(
+            f"/api/admin/appointments/{appointment.id}",
+            headers=auth_headers(reception_token),
+            json={"status": "confirmed"},
+        )
+        assert r.status_code == 200
+
+    def test_reception_cannot_change_a_price(self, client, reception_token, service, variant):
+        """The sharpest edge of the old gap: repricing the menu is exactly the
+        authority the manager-only exchange rate was meant to withhold."""
+        r = client.put(
+            f"/api/admin/services/{service.id}",
+            headers=auth_headers(reception_token),
+            json={"variants": [{"id": variant.id, "price_usd": 1}]},
+        )
+        assert r.status_code == 403
+        assert r.get_json()["error"]["code"] == "forbidden"
+        db.session.refresh(variant)
+        assert str(variant.price_usd) == "100.00"
+
+    def test_reception_is_forbidden_from_every_catalogue_write(
+        self, client, reception_token, service, category, concern, doctor
+    ):
+        writes = [
+            ("post",   "/api/admin/services",                 {"category_id": category.id,
+                                                               "name_ar": "x", "name_en": "x"}),
+            ("put",    f"/api/admin/services/{service.id}",   {"name_en": "renamed"}),
+            ("delete", f"/api/admin/services/{service.id}",   None),
+            ("post",   "/api/admin/categories",               {"name_ar": "x", "name_en": "x"}),
+            ("put",    f"/api/admin/categories/{category.id}", {"name_en": "renamed"}),
+            ("post",   "/api/admin/concerns",                 {"name_ar": "x", "name_en": "x"}),
+            ("put",    f"/api/admin/concerns/{concern.id}",   {"name_en": "renamed"}),
+            ("post",   "/api/admin/doctors",                  {"name_ar": "x", "name_en": "x"}),
+            ("put",    f"/api/admin/doctors/{doctor.id}",     {"name_en": "renamed"}),
+            ("delete", f"/api/admin/doctors/{doctor.id}",     None),
+        ]
+        for method, path, body in writes:
+            call = getattr(client, method)
+            r = call(path, headers=auth_headers(reception_token), json=body) if body is not None \
+                else call(path, headers=auth_headers(reception_token))
+            assert r.status_code == 403, f"{method.upper()} {path} returned {r.status_code}"
+            assert r.get_json()["error"]["code"] == "forbidden"
+
+    def test_manager_may_do_all_of_it(self, client, manager_token, service, variant):
+        r = client.put(
+            f"/api/admin/services/{service.id}",
+            headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "price_usd": 1}]},
+        )
+        assert r.status_code == 200
+        db.session.refresh(variant)
+        assert str(variant.price_usd) == "1.00"
+
+    def test_missing_token_is_401_not_403_on_a_catalogue_write(self, client, service):
+        """An anonymous caller is unauthenticated, not merely under-privileged
+        — the client redirects to login on 401 and shows a message on 403."""
+        r = client.delete(f"/api/admin/services/{service.id}")
+        assert r.status_code == 401
+        assert r.get_json()["error"]["code"] == "unauthorized"
+
 
 # ---------------------------------------------------------------------------
 # Services
 # ---------------------------------------------------------------------------
 
 class TestServices:
-    def test_list(self, client, reception_token, service, variant):
-        r = client.get("/api/admin/services", headers=auth_headers(reception_token))
+    def test_list(self, client, manager_token, service, variant):
+        r = client.get("/api/admin/services", headers=auth_headers(manager_token))
         assert r.status_code == 200
         body = r.get_json()
         assert len(body) == 1
         assert body[0]["category"]["name_en"] == "Injections"
         assert body[0]["variants"][0]["price_usd"] == "100.00"
 
-    def test_filter_by_category(self, client, reception_token, service, category):
-        r = client.get(f"/api/admin/services?category_id={category.id}", headers=auth_headers(reception_token))
+    def test_filter_by_category(self, client, manager_token, service, category):
+        r = client.get(f"/api/admin/services?category_id={category.id}", headers=auth_headers(manager_token))
         assert len(r.get_json()) == 1
-        r2 = client.get("/api/admin/services?category_id=999999", headers=auth_headers(reception_token))
+        r2 = client.get("/api/admin/services?category_id=999999", headers=auth_headers(manager_token))
         assert r2.get_json() == []
 
-    def test_filter_by_availability(self, client, reception_token, service):
-        r = client.get("/api/admin/services?is_available=false", headers=auth_headers(reception_token))
+    def test_filter_by_availability(self, client, manager_token, service):
+        r = client.get("/api/admin/services?is_available=false", headers=auth_headers(manager_token))
         assert r.get_json() == []
-        r2 = client.get("/api/admin/services?is_available=true", headers=auth_headers(reception_token))
+        r2 = client.get("/api/admin/services?is_available=true", headers=auth_headers(manager_token))
         assert len(r2.get_json()) == 1
 
-    def test_create_service_minimal(self, client, reception_token, category):
+    def test_create_service_minimal(self, client, manager_token, category):
         r = client.post(
             "/api/admin/services",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service"},
         )
         assert r.status_code == 201
@@ -410,10 +617,10 @@ class TestServices:
         assert body["is_available"] is True
         assert body["variants"] == []
 
-    def test_create_service_with_variants(self, client, reception_token, category):
+    def test_create_service_with_variants(self, client, manager_token, category):
         r = client.post(
             "/api/admin/services",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={
                 "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
                 "variants": [{"brand_name_ar": "أ", "brand_name_en": "A", "price_usd": 50}],
@@ -422,24 +629,24 @@ class TestServices:
         assert r.status_code == 201
         assert len(r.get_json()["variants"]) == 1
 
-    def test_create_missing_fields(self, client, reception_token):
-        r = client.post("/api/admin/services", headers=auth_headers(reception_token), json={"name_ar": "x"})
+    def test_create_missing_fields(self, client, manager_token):
+        r = client.post("/api/admin/services", headers=auth_headers(manager_token), json={"name_ar": "x"})
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "validation_error"
 
-    def test_create_category_not_found(self, client, reception_token):
+    def test_create_category_not_found(self, client, manager_token):
         r = client.post(
             "/api/admin/services",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={"category_id": 999999, "name_ar": "x", "name_en": "y"},
         )
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "category_not_found"
 
-    def test_create_invalid_variant_price(self, client, reception_token, category):
+    def test_create_invalid_variant_price(self, client, manager_token, category):
         r = client.post(
             "/api/admin/services",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={
                 "category_id": category.id, "name_ar": "x", "name_en": "y",
                 "variants": [{"brand_name_ar": "a", "brand_name_en": "b", "price_usd": -5}],
@@ -448,10 +655,10 @@ class TestServices:
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "validation_error"
 
-    def test_update_service_fields(self, client, reception_token, service):
+    def test_update_service_fields(self, client, manager_token, service):
         r = client.put(
             f"/api/admin/services/{service.id}",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={"name_en": "Botox Updated", "is_available": False},
         )
         assert r.status_code == 200
@@ -459,10 +666,10 @@ class TestServices:
         assert body["name_en"] == "Botox Updated"
         assert body["is_available"] is False
 
-    def test_update_add_new_variant_and_edit_existing(self, client, reception_token, service, variant):
+    def test_update_add_new_variant_and_edit_existing(self, client, manager_token, service, variant):
         r = client.put(
             f"/api/admin/services/{service.id}",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={"variants": [
                 {"id": variant.id, "price_usd": 150},
                 {"brand_name_ar": "جديد", "brand_name_en": "New", "price_usd": 30},
@@ -474,58 +681,58 @@ class TestServices:
         updated = next(v for v in variants if v["id"] == variant.id)
         assert updated["price_usd"] == "150.00"
 
-    def test_update_unknown_variant_id_404(self, client, reception_token, service):
+    def test_update_unknown_variant_id_404(self, client, manager_token, service):
         r = client.put(
             f"/api/admin/services/{service.id}",
-            headers=auth_headers(reception_token),
+            headers=auth_headers(manager_token),
             json={"variants": [{"id": 999999, "price_usd": 10}]},
         )
         assert r.status_code == 404
         assert r.get_json()["error"]["code"] == "variant_not_found"
 
-    def test_update_no_fields(self, client, reception_token, service):
-        r = client.put(f"/api/admin/services/{service.id}", headers=auth_headers(reception_token), json={})
+    def test_update_no_fields(self, client, manager_token, service):
+        r = client.put(f"/api/admin/services/{service.id}", headers=auth_headers(manager_token), json={})
         assert r.status_code == 400
 
-    def test_update_not_found(self, client, reception_token):
+    def test_update_not_found(self, client, manager_token):
         r = client.put(
-            "/api/admin/services/999999", headers=auth_headers(reception_token),
+            "/api/admin/services/999999", headers=auth_headers(manager_token),
             json={"name_ar": "x"},
         )
         assert r.status_code == 404
         assert r.get_json()["error"]["code"] == "service_not_found"
 
-    def test_update_invalid_category(self, client, reception_token, service):
+    def test_update_invalid_category(self, client, manager_token, service):
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"category_id": 999999},
         )
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "category_not_found"
 
-    def test_delete_soft_disables(self, client, reception_token, service):
-        r = client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(reception_token))
+    def test_delete_soft_disables(self, client, manager_token, service):
+        r = client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(manager_token))
         assert r.status_code == 200
         assert r.get_json()["is_available"] is False
         assert Service.query.get(service.id) is not None
 
-    def test_delete_idempotent(self, client, reception_token, service):
-        client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(reception_token))
-        r2 = client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(reception_token))
+    def test_delete_idempotent(self, client, manager_token, service):
+        client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(manager_token))
+        r2 = client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(manager_token))
         assert r2.status_code == 200
         assert r2.get_json()["is_available"] is False
 
-    def test_delete_not_found(self, client, reception_token):
-        r = client.delete("/api/admin/services/999999", headers=auth_headers(reception_token))
+    def test_delete_not_found(self, client, manager_token):
+        r = client.delete("/api/admin/services/999999", headers=auth_headers(manager_token))
         assert r.status_code == 404
 
 
 class TestServiceRelationships:
     """concern_ids / doctor_ids on service create + update."""
 
-    def test_create_with_both_relationships(self, client, reception_token, category, concern, doctor):
+    def test_create_with_both_relationships(self, client, manager_token, category, concern, doctor):
         r = client.post(
-            "/api/admin/services", headers=auth_headers(reception_token),
+            "/api/admin/services", headers=auth_headers(manager_token),
             json={
                 "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
                 "concern_ids": [concern.id], "doctor_ids": [doctor.id],
@@ -538,18 +745,18 @@ class TestServiceRelationships:
         assert body["concerns"][0]["name_en"] == concern.name_en
         assert body["doctors"][0]["name_ar"] == doctor.name_ar
 
-    def test_create_without_relationships_leaves_them_empty(self, client, reception_token, category):
+    def test_create_without_relationships_leaves_them_empty(self, client, manager_token, category):
         r = client.post(
-            "/api/admin/services", headers=auth_headers(reception_token),
+            "/api/admin/services", headers=auth_headers(manager_token),
             json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service"},
         )
         assert r.status_code == 201
         assert r.get_json()["concerns"] == []
         assert r.get_json()["doctors"] == []
 
-    def test_create_with_invalid_concern_id(self, client, reception_token, category):
+    def test_create_with_invalid_concern_id(self, client, manager_token, category):
         r = client.post(
-            "/api/admin/services", headers=auth_headers(reception_token),
+            "/api/admin/services", headers=auth_headers(manager_token),
             json={
                 "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
                 "concern_ids": [999999],
@@ -560,9 +767,9 @@ class TestServiceRelationships:
         # The whole request is rejected — no service row is left behind.
         assert Service.query.filter_by(name_en="Service").first() is None
 
-    def test_create_with_invalid_doctor_id(self, client, reception_token, category):
+    def test_create_with_invalid_doctor_id(self, client, manager_token, category):
         r = client.post(
-            "/api/admin/services", headers=auth_headers(reception_token),
+            "/api/admin/services", headers=auth_headers(manager_token),
             json={
                 "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
                 "doctor_ids": [999999],
@@ -573,7 +780,7 @@ class TestServiceRelationships:
         assert Service.query.filter_by(name_en="Service").first() is None
 
     def test_update_concerns_only_leaves_doctors_untouched(
-        self, client, reception_token, service, concern, doctor
+        self, client, manager_token, service, concern, doctor
     ):
         service.concerns = [concern]
         service.doctors = [doctor]
@@ -584,7 +791,7 @@ class TestServiceRelationships:
         db.session.commit()
 
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": [other.id]},
         )
         assert r.status_code == 200
@@ -593,7 +800,7 @@ class TestServiceRelationships:
         # doctor_ids was absent from the body, so the link survives.
         assert [d["id"] for d in body["doctors"]] == [doctor.id]
 
-    def test_update_replaces_rather_than_merges(self, client, reception_token, service, concern):
+    def test_update_replaces_rather_than_merges(self, client, manager_token, service, concern):
         second = Concern(name_ar="ثانية", name_en="Second")
         third = Concern(name_ar="ثالثة", name_en="Third")
         db.session.add_all([second, third])
@@ -602,7 +809,7 @@ class TestServiceRelationships:
         db.session.commit()
 
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": [second.id]},
         )
         assert r.status_code == 200
@@ -615,26 +822,26 @@ class TestServiceRelationships:
         assert [row.concern_id for row in rows] == [second.id]
 
     def test_update_with_empty_list_unlinks_everything(
-        self, client, reception_token, service, concern
+        self, client, manager_token, service, concern
     ):
         service.concerns = [concern]
         db.session.commit()
 
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": []},
         )
         assert r.status_code == 200
         assert r.get_json()["concerns"] == []
 
     def test_update_invalid_concern_id_changes_nothing(
-        self, client, reception_token, service, concern
+        self, client, manager_token, service, concern
     ):
         service.concerns = [concern]
         db.session.commit()
 
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"name_en": "Should Not Persist", "concern_ids": [99999]},
         )
         assert r.status_code == 400
@@ -647,13 +854,13 @@ class TestServiceRelationships:
         assert [c.id for c in refreshed.concerns] == [concern.id]
 
     def test_update_invalid_doctor_id_changes_nothing(
-        self, client, reception_token, service, doctor
+        self, client, manager_token, service, doctor
     ):
         service.doctors = [doctor]
         db.session.commit()
 
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"name_en": "Should Not Persist", "doctor_ids": [99999]},
         )
         assert r.status_code == 400
@@ -664,38 +871,38 @@ class TestServiceRelationships:
         assert refreshed.name_en != "Should Not Persist"
         assert [d.id for d in refreshed.doctors] == [doctor.id]
 
-    def test_relationship_ids_only_is_a_valid_update(self, client, reception_token, service, concern):
+    def test_relationship_ids_only_is_a_valid_update(self, client, manager_token, service, concern):
         """concern_ids alone must satisfy the has-recognized-fields check."""
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": [concern.id]},
         )
         assert r.status_code == 200
 
-    def test_non_list_concern_ids_is_a_validation_error(self, client, reception_token, service):
+    def test_non_list_concern_ids_is_a_validation_error(self, client, manager_token, service):
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": "1,2"},
         )
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "validation_error"
 
-    def test_duplicate_ids_are_deduplicated(self, client, reception_token, service, concern):
+    def test_duplicate_ids_are_deduplicated(self, client, manager_token, service, concern):
         r = client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": [concern.id, concern.id]},
         )
         assert r.status_code == 200
         assert [c["id"] for c in r.get_json()["concerns"]] == [concern.id]
 
     def test_listing_reflects_saved_relationships(
-        self, client, reception_token, service, concern, doctor
+        self, client, manager_token, service, concern, doctor
     ):
         client.put(
-            f"/api/admin/services/{service.id}", headers=auth_headers(reception_token),
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
             json={"concern_ids": [concern.id], "doctor_ids": [doctor.id]},
         )
-        r = client.get("/api/admin/services", headers=auth_headers(reception_token))
+        r = client.get("/api/admin/services", headers=auth_headers(manager_token))
         assert r.status_code == 200
         entry = next(s for s in r.get_json() if s["id"] == service.id)
         assert [c["id"] for c in entry["concerns"]] == [concern.id]
@@ -707,63 +914,63 @@ class TestServiceRelationships:
 # ---------------------------------------------------------------------------
 
 class TestCategories:
-    def test_list(self, client, reception_token, category):
-        r = client.get("/api/admin/categories", headers=auth_headers(reception_token))
+    def test_list(self, client, manager_token, category):
+        r = client.get("/api/admin/categories", headers=auth_headers(manager_token))
         assert r.status_code == 200
         assert len(r.get_json()) == 1
 
-    def test_create(self, client, reception_token):
+    def test_create(self, client, manager_token):
         r = client.post(
-            "/api/admin/categories", headers=auth_headers(reception_token),
+            "/api/admin/categories", headers=auth_headers(manager_token),
             json={"name_ar": "جديد", "name_en": "New"},
         )
         assert r.status_code == 201
         assert r.get_json()["name_en"] == "New"
 
-    def test_create_missing_fields(self, client, reception_token):
-        r = client.post("/api/admin/categories", headers=auth_headers(reception_token), json={"name_ar": "x"})
+    def test_create_missing_fields(self, client, manager_token):
+        r = client.post("/api/admin/categories", headers=auth_headers(manager_token), json={"name_ar": "x"})
         assert r.status_code == 400
 
-    def test_create_duplicate_case_insensitive(self, client, reception_token, category):
+    def test_create_duplicate_case_insensitive(self, client, manager_token, category):
         r = client.post(
-            "/api/admin/categories", headers=auth_headers(reception_token),
+            "/api/admin/categories", headers=auth_headers(manager_token),
             json={"name_ar": "حقن2", "name_en": "injections"},
         )
         assert r.status_code == 409
         assert r.get_json()["error"]["code"] == "duplicate_category"
 
-    def test_create_whitespace_name_invalid(self, client, reception_token):
+    def test_create_whitespace_name_invalid(self, client, manager_token):
         r = client.post(
-            "/api/admin/categories", headers=auth_headers(reception_token),
+            "/api/admin/categories", headers=auth_headers(manager_token),
             json={"name_ar": "   ", "name_en": "x"},
         )
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "validation_error"
 
-    def test_update(self, client, reception_token, category):
+    def test_update(self, client, manager_token, category):
         r = client.put(
-            f"/api/admin/categories/{category.id}", headers=auth_headers(reception_token),
+            f"/api/admin/categories/{category.id}", headers=auth_headers(manager_token),
             json={"name_en": "Injections Updated"},
         )
         assert r.status_code == 200
         assert r.get_json()["name_en"] == "Injections Updated"
 
-    def test_update_duplicate_excludes_self(self, client, reception_token, category):
+    def test_update_duplicate_excludes_self(self, client, manager_token, category):
         r = client.put(
-            f"/api/admin/categories/{category.id}", headers=auth_headers(reception_token),
+            f"/api/admin/categories/{category.id}", headers=auth_headers(manager_token),
             json={"name_ar": category.name_ar},
         )
         assert r.status_code == 200
 
-    def test_update_not_found(self, client, reception_token):
+    def test_update_not_found(self, client, manager_token):
         r = client.put(
-            "/api/admin/categories/999999", headers=auth_headers(reception_token),
+            "/api/admin/categories/999999", headers=auth_headers(manager_token),
             json={"name_ar": "x"},
         )
         assert r.status_code == 404
 
-    def test_update_no_fields(self, client, reception_token, category):
-        r = client.put(f"/api/admin/categories/{category.id}", headers=auth_headers(reception_token), json={})
+    def test_update_no_fields(self, client, manager_token, category):
+        r = client.put(f"/api/admin/categories/{category.id}", headers=auth_headers(manager_token), json={})
         assert r.status_code == 400
 
 
@@ -772,43 +979,43 @@ class TestCategories:
 # ---------------------------------------------------------------------------
 
 class TestConcerns:
-    def test_list(self, client, reception_token, concern):
-        r = client.get("/api/admin/concerns", headers=auth_headers(reception_token))
+    def test_list(self, client, manager_token, concern):
+        r = client.get("/api/admin/concerns", headers=auth_headers(manager_token))
         assert len(r.get_json()) == 1
 
-    def test_create(self, client, reception_token):
+    def test_create(self, client, manager_token):
         r = client.post(
-            "/api/admin/concerns", headers=auth_headers(reception_token),
+            "/api/admin/concerns", headers=auth_headers(manager_token),
             json={"name_ar": "جديد", "name_en": "New", "description_en": "d"},
         )
         assert r.status_code == 201
 
-    def test_create_duplicate(self, client, reception_token, concern):
+    def test_create_duplicate(self, client, manager_token, concern):
         r = client.post(
-            "/api/admin/concerns", headers=auth_headers(reception_token),
+            "/api/admin/concerns", headers=auth_headers(manager_token),
             json={"name_ar": "x", "name_en": concern.name_en},
         )
         assert r.status_code == 409
         assert r.get_json()["error"]["code"] == "duplicate_concern"
 
-    def test_create_invalid_description_type(self, client, reception_token):
+    def test_create_invalid_description_type(self, client, manager_token):
         r = client.post(
-            "/api/admin/concerns", headers=auth_headers(reception_token),
+            "/api/admin/concerns", headers=auth_headers(manager_token),
             json={"name_ar": "x", "name_en": "y", "description_ar": 123},
         )
         assert r.status_code == 400
 
-    def test_update(self, client, reception_token, concern):
+    def test_update(self, client, manager_token, concern):
         r = client.put(
-            f"/api/admin/concerns/{concern.id}", headers=auth_headers(reception_token),
+            f"/api/admin/concerns/{concern.id}", headers=auth_headers(manager_token),
             json={"description_en": "updated"},
         )
         assert r.status_code == 200
         assert r.get_json()["description_en"] == "updated"
 
-    def test_update_not_found(self, client, reception_token):
+    def test_update_not_found(self, client, manager_token):
         r = client.put(
-            "/api/admin/concerns/999999", headers=auth_headers(reception_token),
+            "/api/admin/concerns/999999", headers=auth_headers(manager_token),
             json={"name_ar": "x"},
         )
         assert r.status_code == 404
@@ -819,64 +1026,64 @@ class TestConcerns:
 # ---------------------------------------------------------------------------
 
 class TestDoctors:
-    def test_list(self, client, reception_token, doctor):
-        r = client.get("/api/admin/doctors", headers=auth_headers(reception_token))
+    def test_list(self, client, manager_token, doctor):
+        r = client.get("/api/admin/doctors", headers=auth_headers(manager_token))
         assert len(r.get_json()) == 1
         assert r.get_json()[0]["service_ids"] == []
 
-    def test_filter_by_availability(self, client, reception_token, doctor):
-        r = client.get("/api/admin/doctors?is_available=false", headers=auth_headers(reception_token))
+    def test_filter_by_availability(self, client, manager_token, doctor):
+        r = client.get("/api/admin/doctors?is_available=false", headers=auth_headers(manager_token))
         assert r.get_json() == []
 
-    def test_create_with_services(self, client, reception_token, service):
+    def test_create_with_services(self, client, manager_token, service):
         r = client.post(
-            "/api/admin/doctors", headers=auth_headers(reception_token),
+            "/api/admin/doctors", headers=auth_headers(manager_token),
             json={"name_ar": "د. جديد", "name_en": "Dr. New", "service_ids": [service.id]},
         )
         assert r.status_code == 201
         assert r.get_json()["service_ids"] == [service.id]
 
-    def test_create_invalid_service_ids(self, client, reception_token):
+    def test_create_invalid_service_ids(self, client, manager_token):
         r = client.post(
-            "/api/admin/doctors", headers=auth_headers(reception_token),
+            "/api/admin/doctors", headers=auth_headers(manager_token),
             json={"name_ar": "د. جديد", "name_en": "Dr. New", "service_ids": [999999]},
         )
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "invalid_service_ids"
 
-    def test_create_missing_fields(self, client, reception_token):
-        r = client.post("/api/admin/doctors", headers=auth_headers(reception_token), json={"name_ar": "x"})
+    def test_create_missing_fields(self, client, manager_token):
+        r = client.post("/api/admin/doctors", headers=auth_headers(manager_token), json={"name_ar": "x"})
         assert r.status_code == 400
 
-    def test_update_replaces_service_ids(self, client, reception_token, doctor, service):
+    def test_update_replaces_service_ids(self, client, manager_token, doctor, service):
         r = client.put(
-            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(reception_token),
+            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token),
             json={"service_ids": [service.id]},
         )
         assert r.status_code == 200
         assert r.get_json()["service_ids"] == [service.id]
 
         r2 = client.put(
-            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(reception_token),
+            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token),
             json={"service_ids": []},
         )
         assert r2.get_json()["service_ids"] == []
 
-    def test_update_not_found(self, client, reception_token):
+    def test_update_not_found(self, client, manager_token):
         r = client.put(
-            "/api/admin/doctors/999999", headers=auth_headers(reception_token),
+            "/api/admin/doctors/999999", headers=auth_headers(manager_token),
             json={"name_ar": "x"},
         )
         assert r.status_code == 404
 
-    def test_delete_soft_disables(self, client, reception_token, doctor):
-        r = client.delete(f"/api/admin/doctors/{doctor.id}", headers=auth_headers(reception_token))
+    def test_delete_soft_disables(self, client, manager_token, doctor):
+        r = client.delete(f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token))
         assert r.status_code == 200
         assert r.get_json()["is_available"] is False
         assert Doctor.query.get(doctor.id) is not None
 
-    def test_delete_not_found(self, client, reception_token):
-        r = client.delete("/api/admin/doctors/999999", headers=auth_headers(reception_token))
+    def test_delete_not_found(self, client, manager_token):
+        r = client.delete("/api/admin/doctors/999999", headers=auth_headers(manager_token))
         assert r.status_code == 404
 
 
@@ -983,7 +1190,11 @@ class TestOffers:
             json={"items": [{"service_variant_id": v2.id, "offer_price_syp": 10000}]},
         )
         assert r.status_code == 200
-        assert len(r.get_json()["items"]) == 2
+        items = r.get_json()["items"]
+        # Both rows survive; the one left out of `items` is deactivated rather
+        # than deleted (see TestOfferItemRemoval).
+        assert len(items) == 2
+        assert next(i for i in items if i["service_variant_id"] == v2.id)["is_active"] is True
 
     def test_update_existing_item_by_id(self, client, manager_token, offer):
         item_id = offer.items[0].id
@@ -1032,6 +1243,179 @@ class TestOffers:
     def test_delete_forbidden_for_reception(self, client, reception_token, offer):
         r = client.delete(f"/api/admin/offers/{offer.id}", headers=auth_headers(reception_token))
         assert r.status_code == 403
+
+
+class TestOfferItemRemoval:
+    """`items` on PUT is the offer's complete set of live brands. Anything
+    left out is deactivated rather than deleted, so a past appointment's
+    offer_item_id still resolves to the price it was booked at."""
+
+    def _second_variant(self, service):
+        v = ServiceVariant(
+            service_id=service.id,
+            brand_name_ar="فرنسي", brand_name_en="French",
+            price_usd=150.00, is_available=True,
+        )
+        db.session.add(v)
+        db.session.commit()
+        return v
+
+    def test_items_default_to_active_on_create(self, client, manager_token, variant):
+        r = client.post(
+            "/api/admin/offers", headers=auth_headers(manager_token),
+            json={
+                "title_ar": "عرض", "title_en": "Offer",
+                "start_date": str(date.today()), "end_date": str(date.today() + timedelta(days=5)),
+                "items": [{"service_variant_id": variant.id, "offer_price_syp": 500000}],
+            },
+        )
+        assert r.status_code == 201
+        assert r.get_json()["items"][0]["is_active"] is True
+
+    def test_omitted_item_is_deactivated_not_deleted(
+        self, client, manager_token, offer, service, variant
+    ):
+        second = self._second_variant(service)
+        client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [
+                {"id": offer.items[0].id},
+                {"service_variant_id": second.id, "offer_price_syp": 700000},
+            ]},
+        )
+        original_id = offer.items[0].id
+
+        # Now drop the original, keeping only the second brand.
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [{"service_variant_id": second.id, "offer_price_syp": 700000}]},
+        )
+        assert r.status_code == 200
+
+        by_id = {i["id"]: i for i in r.get_json()["items"]}
+        assert by_id[original_id]["is_active"] is False, "removed item should be flagged"
+        assert OfferItem.query.get(original_id) is not None, "row must survive for FK safety"
+
+    def test_removed_item_disappears_from_the_public_site(
+        self, client, manager_token, offer, variant, service
+    ):
+        item_id = offer.items[0].id
+        second = self._second_variant(service)
+
+        detail = client.get(f"/api/services/{service.id}").get_json()
+        before = next(v for v in detail["variants"] if v["id"] == variant.id)
+        assert before["active_offer"] is not None
+
+        client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [{"service_variant_id": second.id, "offer_price_syp": 700000}]},
+        )
+
+        detail = client.get(f"/api/services/{service.id}").get_json()
+        after = next(v for v in detail["variants"] if v["id"] == variant.id)
+        assert after["active_offer"] is None
+        assert OfferItem.query.get(item_id) is not None
+
+    def test_removed_item_cannot_price_a_new_booking(
+        self, client, manager_token, offer, variant, doctor, service
+    ):
+        from app.models import ExchangeRate
+        db.session.add(ExchangeRate(rate=14000))
+        # The booking below has to reach the offer check, so the doctor must
+        # already be a valid choice for this service.
+        service.doctors = [doctor]
+        db.session.commit()
+
+        item_id = offer.items[0].id
+        second = self._second_variant(service)
+        client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [{"service_variant_id": second.id, "offer_price_syp": 700000}]},
+        )
+
+        r = client.post("/api/appointments", json={
+            "patient_name": "سارة", "patient_phone": "+963900000000",
+            "service_variant_id": variant.id, "doctor_id": doctor.id,
+            "preferred_day": str(date.today() + timedelta(days=2)),
+            "offer_item_id": item_id,
+        })
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "invalid_offer"
+
+    def test_re_adding_a_removed_brand_revives_the_same_row(
+        self, client, manager_token, offer, variant, service
+    ):
+        """Otherwise the offer would end up with two rows for one variant."""
+        original_id = offer.items[0].id
+        second = self._second_variant(service)
+
+        client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [{"service_variant_id": second.id, "offer_price_syp": 700000}]},
+        )
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [
+                {"service_variant_id": second.id, "offer_price_syp": 700000},
+                {"service_variant_id": variant.id, "offer_price_syp": 850000},
+            ]},
+        )
+        assert r.status_code == 200
+        items = r.get_json()["items"]
+
+        rows_for_variant = [i for i in items if i["service_variant_id"] == variant.id]
+        assert len(rows_for_variant) == 1, "must not open a second row for the same brand"
+        assert rows_for_variant[0]["id"] == original_id
+        assert rows_for_variant[0]["is_active"] is True
+        assert rows_for_variant[0]["offer_price_syp"] == "850000.00"
+
+    def test_empty_items_deactivates_every_brand(self, client, manager_token, offer):
+        item_id = offer.items[0].id
+
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": []},
+        )
+        assert r.status_code == 200
+        assert all(i["is_active"] is False for i in r.get_json()["items"])
+        assert OfferItem.query.get(item_id) is not None
+
+    def test_omitting_items_entirely_leaves_them_untouched(
+        self, client, manager_token, offer
+    ):
+        """Absent key means "don't touch", same as everywhere else in the API
+        — only an explicit `items` array rewrites the set."""
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"title_en": "Renamed"},
+        )
+        assert r.status_code == 200
+        assert all(i["is_active"] is True for i in r.get_json()["items"])
+
+    def test_duplicate_variant_via_mixed_id_and_variant_id_is_rejected(
+        self, client, manager_token, offer, variant
+    ):
+        """{"id": N} and the variant N already points at must not both go live."""
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [
+                {"id": offer.items[0].id},
+                {"service_variant_id": variant.id, "offer_price_syp": 999},
+            ]},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "duplicate_offer_item"
+
+    def test_invalid_is_active_on_an_item_is_rejected(
+        self, client, manager_token, offer, variant
+    ):
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"items": [{"service_variant_id": variant.id,
+                             "offer_price_syp": 1, "is_active": "yes"}]},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
 
 
 # ---------------------------------------------------------------------------
