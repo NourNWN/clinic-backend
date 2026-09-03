@@ -5,14 +5,49 @@ from app.models import ServiceVariant, Doctor, Appointment, OfferItem, ExchangeR
 
 appointments_bp = Blueprint("appointments", __name__)
 
+REQUIRED_FIELDS = ["patient_name", "patient_phone", "service_variant_id", "doctor_id", "preferred_day"]
+
+
+def _invalid_field_error(field):
+    return {
+        "error": {
+            "code": "validation_error",
+            "message_ar": f"قيمة الحقل غير صالحة: {field}",
+            "message_en": f"Invalid value for field: {field}",
+        }
+    }
+
+
+def _parse_date(value):
+    """An ISO date string -> `date`, or None if it isn't one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _parse_id(value):
+    """A row id -> int, or None if it isn't usable as one. Bools are rejected
+    explicitly because `isinstance(True, int)` is True."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
 
 @appointments_bp.route("/api/appointments", methods=["POST"])
 def create_appointment():
-    data = request.get_json()
+    # silent=True so a missing or unparseable body becomes the bilingual
+    # "missing fields" error below rather than Flask's own HTML 400. A body
+    # that parses but isn't an object (a JSON array, say) is truthy, so it
+    # needs the isinstance check too — .get() on a list would be a 500.
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
 
     # 1. Validate required fields
-    required_fields = ["patient_name", "patient_phone", "service_variant_id", "doctor_id", "preferred_day"]
-    missing = [f for f in required_fields if not data.get(f)]
+    missing = [f for f in REQUIRED_FIELDS if not data.get(f)]
     if missing:
         return jsonify({
             "error": {
@@ -22,8 +57,24 @@ def create_appointment():
             }
         }), 400
 
-    # 2. Validate variant and doctor exist
-    variant = ServiceVariant.query.get(data["service_variant_id"])
+    # 2. Check the shape of every value before it reaches a query or the
+    #    session. An unparseable date or a non-numeric id would otherwise
+    #    reach the driver and surface as an unhandled 500 (an HTML traceback,
+    #    not the JSON error envelope every other path returns).
+    preferred_day = _parse_date(data["preferred_day"])
+    if preferred_day is None:
+        return jsonify(_invalid_field_error("preferred_day")), 400
+
+    service_variant_id = _parse_id(data["service_variant_id"])
+    if service_variant_id is None:
+        return jsonify(_invalid_field_error("service_variant_id")), 400
+
+    doctor_id = _parse_id(data["doctor_id"])
+    if doctor_id is None:
+        return jsonify(_invalid_field_error("doctor_id")), 400
+
+    # 3. Validate variant and doctor exist
+    variant = ServiceVariant.query.get(service_variant_id)
     if not variant or not variant.is_available:
         return jsonify({
             "error": {
@@ -33,7 +84,7 @@ def create_appointment():
             }
         }), 400
 
-    doctor = Doctor.query.get(data["doctor_id"])
+    doctor = Doctor.query.get(doctor_id)
     if not doctor:
         return jsonify({
             "error": {
@@ -43,7 +94,7 @@ def create_appointment():
             }
         }), 400
 
-    # 3. Get current exchange rate (needed regardless of offer, for record-keeping)
+    # 4. Get current exchange rate (needed regardless of offer, for record-keeping)
     latest_rate = ExchangeRate.query.order_by(ExchangeRate.updated_at.desc()).first()
     if not latest_rate:
         return jsonify({
@@ -55,11 +106,15 @@ def create_appointment():
         }), 503
     exchange_rate_used = latest_rate.rate
 
-    # 4. Calculate final price — offer price or regular calculated price
-    offer_item_id = data.get("offer_item_id")
+    # 5. Calculate final price — offer price or regular calculated price
+    raw_offer_item_id = data.get("offer_item_id")
     offer_item = None
 
-    if offer_item_id:
+    if raw_offer_item_id:
+        offer_item_id = _parse_id(raw_offer_item_id)
+        if offer_item_id is None:
+            return jsonify(_invalid_field_error("offer_item_id")), 400
+
         offer_item = OfferItem.query.get(offer_item_id)
         today = date.today()
 
@@ -82,13 +137,13 @@ def create_appointment():
     else:
         final_price_syp = variant.price_usd * exchange_rate_used
 
-    # 5. Create and save the appointment — freezing the price at booking time
+    # 6. Create and save the appointment — freezing the price at booking time
     appointment = Appointment(
         patient_name=data["patient_name"],
         patient_phone=data["patient_phone"],
         service_variant_id=variant.id,
         doctor_id=doctor.id,
-        preferred_day=data["preferred_day"],
+        preferred_day=preferred_day,
         status="pending",
         offer_item_id=offer_item.id if offer_item else None,
         final_price_syp_at_booking=final_price_syp,
