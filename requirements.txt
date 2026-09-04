@@ -4,8 +4,4 @@ Flask-Migrate==4.0.7
 Flask-Cors==4.0.1
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
-PyJWT==2.9.0
-dotenv
-flask_sqlalchemy
-flask_migrate
-flask_cors
+PyJWT==2.13.0

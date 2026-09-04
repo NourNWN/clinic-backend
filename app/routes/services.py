@@ -121,11 +121,14 @@ def get_service_detail(service_id):
         if not v.is_available:
             continue
 
-        # Check if this variant has an active offer right now
+        # Check if this variant has an active offer right now. A brand removed
+        # from an offer keeps its row (bookings reference it) but is flagged
+        # inactive, so the item's own flag matters as much as the offer's.
         active_offer = None
         for item in v.offer_items:
             offer = item.offer
-            if offer.is_active and offer.start_date <= today <= offer.end_date:
+            if item.is_active and offer.is_active \
+                    and offer.start_date <= today <= offer.end_date:
                 active_offer = {
                     "offer_item_id": item.id,
                     "offer_id": offer.id,

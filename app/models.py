@@ -136,6 +136,11 @@ class OfferItem(db.Model):
     service_variant_id = db.Column(db.Integer, db.ForeignKey("service_variants.id"), nullable=False)
     offer_price_syp = db.Column(db.Numeric(12, 2), nullable=False)
 
+    # Removing a brand from an offer clears this rather than deleting the row:
+    # Appointment.offer_item_id may still point here, and the frozen price on
+    # that booking has to stay resolvable.
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+
     service_variant = db.relationship("ServiceVariant", back_populates="offer_items")
 
     def __repr__(self):
