@@ -4,6 +4,7 @@ from flask import Blueprint, g, jsonify, request
 from sqlalchemy.orm import joinedload
 from werkzeug.security import check_password_hash
 
+from app import rate_limit
 from app.auth import generate_token, require_auth, require_role
 from app.extensions import db
 from app.models import (
@@ -53,6 +54,14 @@ INVALID_CREDENTIALS_ERROR = {
         "code": "invalid_credentials",
         "message_ar": "اسم المستخدم أو كلمة المرور غير صحيحة",
         "message_en": "Invalid username or password",
+    }
+}
+
+TOO_MANY_ATTEMPTS_ERROR = {
+    "error": {
+        "code": "too_many_attempts",
+        "message_ar": "عدد محاولات الدخول تجاوز الحد، حاولي مرة تانية بعد شوي",
+        "message_en": "Too many login attempts, please try again later",
     }
 }
 
@@ -593,13 +602,36 @@ def _serialize_appointment_detail(a):
     return data
 
 
+def _login_rate_limit_key():
+    """
+    What a login lockout is counted against: the caller's IP address.
+
+    Deliberately not the submitted username — keying on that would let
+    anyone lock a known account (say `admin`) out of its own panel just by
+    guessing at it, turning brute-force protection into a denial of service
+    against staff.
+    """
+    return request.remote_addr or "unknown"
+
+
 @admin_bp.route("/api/admin/login", methods=["POST"])
 def login():
+    # Checked before the body is even read: a locked-out caller gets the
+    # same answer whatever they send.
+    rate_key = _login_rate_limit_key()
+    allowed, retry_after = rate_limit.check(rate_key)
+    if not allowed:
+        response = jsonify(TOO_MANY_ATTEMPTS_ERROR)
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
+
     data = request.get_json(silent=True) or {}
     username = data.get("username")
     password = data.get("password")
 
     if not username or not password:
+        # A malformed request is not evidence of guessing, so it isn't
+        # counted — otherwise a buggy client could lock out the whole clinic.
         return jsonify(INVALID_CREDENTIALS_ERROR), 401
 
     user = AdminUser.query.filter_by(username=username).first()
@@ -607,8 +639,10 @@ def login():
     # Same generic error whether the username doesn't exist or the password
     # is wrong, so a caller can't use this endpoint to enumerate usernames.
     if not user or not check_password_hash(user.password_hash, password):
+        rate_limit.record_failure(rate_key)
         return jsonify(INVALID_CREDENTIALS_ERROR), 401
 
+    rate_limit.clear(rate_key)
     token = generate_token(user)
 
     return jsonify({

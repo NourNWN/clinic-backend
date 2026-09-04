@@ -7,8 +7,27 @@ from app.models import (
 )
 from werkzeug.security import generate_password_hash
 from datetime import date, timedelta
+import os
+import secrets
 
 app = create_app()
+
+
+def _seed_password(env_var):
+    """
+    The password to give a seeded admin account.
+
+    These used to be `admin123` / `reception123`, written into this file and
+    printed at the end — which meant every deployment seeded from this
+    script shipped with the same publicly known credentials guarding its
+    admin panel. Now the value comes from the environment, and when it isn't
+    set a random one is generated and printed once, so a seeded database is
+    never reachable with a password an outsider could guess.
+    """
+    supplied = os.environ.get(env_var)
+    if supplied:
+        return supplied, False
+    return secrets.token_urlsafe(12), True
 
 with app.app_context():
     # امسحي البيانات القديمة بترتيب يحترم القيود (FK) حتى تقدري تشغلي السكربت أكتر من مرة
@@ -229,15 +248,18 @@ with app.app_context():
     db.session.commit()
 
     # ---------- حسابات الأدمن ----------
+    manager_password, manager_generated = _seed_password("SEED_ADMIN_PASSWORD")
+    reception_password, reception_generated = _seed_password("SEED_RECEPTION_PASSWORD")
+
     manager = AdminUser(
         username="admin",
-        password_hash=generate_password_hash("admin123"),
+        password_hash=generate_password_hash(manager_password),
         full_name="مديرة العيادة",
         role="manager",
     )
     reception = AdminUser(
         username="reception",
-        password_hash=generate_password_hash("reception123"),
+        password_hash=generate_password_hash(reception_password),
         full_name="موظفة الاستقبال",
         role="reception",
     )
@@ -307,4 +329,15 @@ with app.app_context():
     print("تمت إضافة البيانات التجريبية بنجاح")
     print(f"- {len(categories)} categories, {len(concerns)} concerns, {len(doctors)} doctors")
     print(f"- {len(services)} services, {len(variants)} variants")
-    print("- 2 offers, 3 appointments, admin login: admin / admin123")
+    print("- 2 offers, 3 appointments")
+    print()
+    print("حسابات الدخول (Admin accounts):")
+    for username, password, generated in (
+        ("admin", manager_password, manager_generated),
+        ("reception", reception_password, reception_generated),
+    ):
+        if generated:
+            # Printed once and never stored in plain text again — copy it now.
+            print(f"  {username} / {password}   (generated — save it, it is not shown again)")
+        else:
+            print(f"  {username} / (the value of the environment variable you set)")

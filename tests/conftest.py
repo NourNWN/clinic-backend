@@ -121,6 +121,7 @@ _create_database_if_missing(TEST_DATABASE_URL)
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL.render_as_string(hide_password=False)
 
 from app import create_app  # noqa: E402
+from app import rate_limit  # noqa: E402
 from app.extensions import db  # noqa: E402
 from app.models import (  # noqa: E402
     AdminUser, Category, Concern, Doctor, ExchangeRate, Offer, OfferItem,
@@ -174,6 +175,12 @@ def _clean_database(app):
     """
     db.session.rollback()
     db.session.remove()
+
+    # The login throttle counts failures in module-level state, which would
+    # otherwise carry across tests: enough tests posting a wrong password
+    # from the same test client would start locking each other out, and
+    # which ones failed would depend on execution order.
+    rate_limit.reset_all()
 
     _assert_engine_is_the_test_database()
     table_names = ", ".join(f'"{t.name}"' for t in db.metadata.sorted_tables)

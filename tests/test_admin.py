@@ -5,6 +5,7 @@ import jwt
 import pytest
 from flask import current_app
 
+from app import rate_limit
 from app.auth import _authenticate
 
 from app.extensions import db
@@ -68,6 +69,97 @@ class TestLogin:
         r = client.post("/api/admin/login", data="username=x&password=y", content_type="text/plain")
         assert r.is_json
         assert r.get_json()["error"]["code"] == "invalid_credentials"
+
+
+# ---------------------------------------------------------------------------
+# Login brute-force protection
+# ---------------------------------------------------------------------------
+
+class TestLoginRateLimit:
+    """The login endpoint used to accept unlimited guesses at full speed."""
+
+    def _fail(self, client, username="manager1"):
+        return client.post(
+            "/api/admin/login", json={"username": username, "password": "wrong"}
+        )
+
+    def test_failures_up_to_the_limit_still_answer_401(self, client, manager_user):
+        for _ in range(rate_limit.MAX_FAILURES):
+            r = self._fail(client)
+            assert r.status_code == 401
+            assert r.get_json()["error"]["code"] == "invalid_credentials"
+
+    def test_one_failure_past_the_limit_locks_out(self, client, manager_user):
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client)
+
+        r = self._fail(client)
+        assert r.status_code == 429
+        assert r.get_json()["error"]["code"] == "too_many_attempts"
+        assert int(r.headers["Retry-After"]) > 0
+
+    def test_lockout_blocks_the_correct_password_too(self, client, manager_user):
+        """Otherwise the limit is decorative: a guesser who lands on the right
+        password on attempt N+1 would still be let in."""
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client)
+
+        r = client.post(
+            "/api/admin/login",
+            json={"username": "manager1", "password": "manager-pass"},
+        )
+        assert r.status_code == 429
+
+    def test_lockout_is_not_per_username(self, client, manager_user, reception_user):
+        """The counter is keyed on the caller, not the account they name, so
+        switching usernames does not buy a fresh allowance."""
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client, username="manager1")
+
+        r = self._fail(client, username="reception1")
+        assert r.status_code == 429
+
+    def test_success_clears_the_counter(self, client, manager_user):
+        """Four typos then the right password must not leave the user one
+        slip from a lockout."""
+        for _ in range(rate_limit.MAX_FAILURES - 1):
+            self._fail(client)
+
+        ok = client.post(
+            "/api/admin/login",
+            json={"username": "manager1", "password": "manager-pass"},
+        )
+        assert ok.status_code == 200
+
+        # A full fresh allowance, not one attempt.
+        for _ in range(rate_limit.MAX_FAILURES):
+            assert self._fail(client).status_code == 401
+
+    def test_malformed_requests_do_not_count_toward_the_limit(self, client, manager_user):
+        """A buggy client sending empty bodies is not guessing passwords, and
+        must not be able to lock the clinic out of its own panel."""
+        for _ in range(rate_limit.MAX_FAILURES * 2):
+            assert client.post("/api/admin/login", json={}).status_code == 401
+
+        r = client.post(
+            "/api/admin/login",
+            json={"username": "manager1", "password": "manager-pass"},
+        )
+        assert r.status_code == 200
+
+    def test_failures_age_out_of_the_window(self, client, manager_user, monkeypatch):
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client)
+        assert self._fail(client).status_code == 429
+
+        # Jump past the window rather than sleeping through it.
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            rate_limit.time,
+            "monotonic",
+            lambda: real_monotonic() + rate_limit.WINDOW_SECONDS + 1,
+        )
+        assert self._fail(client).status_code == 401
 
 
 # ---------------------------------------------------------------------------
