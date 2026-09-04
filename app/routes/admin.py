@@ -22,7 +22,7 @@ PATCHABLE_APPOINTMENT_FIELDS = {
 REQUIRED_SERVICE_FIELDS = ["category_id", "name_ar", "name_en"]
 EDITABLE_SERVICE_FIELDS = {
     "category_id", "name_ar", "name_en", "description_ar", "description_en",
-    "duration_estimate", "is_available",
+    "duration_estimate", "photo_url", "is_available",
 }
 REQUIRED_VARIANT_FIELDS = ["brand_name_ar", "brand_name_en", "price_usd"]
 
@@ -40,8 +40,13 @@ EDITABLE_DOCTOR_FIELDS = {
 DOCTOR_STRING_FIELDS = ("specialty_ar", "specialty_en", "bio_ar", "bio_en", "photo_url")
 
 REQUIRED_OFFER_FIELDS = ["title_ar", "title_en", "start_date", "end_date", "items"]
-EDITABLE_OFFER_FIELDS = {"title_ar", "title_en", "start_date", "end_date", "is_active"}
+EDITABLE_OFFER_FIELDS = {"title_ar", "title_en", "photo_url", "start_date", "end_date", "is_active"}
 REQUIRED_OFFER_ITEM_FIELDS = ["service_variant_id", "offer_price_syp"]
+
+# Mirrors the photo_url column width on services, service_variants, offers
+# and doctors. Without the check an over-long URL only fails at the driver,
+# as a psycopg2 DataError — an HTML 500 instead of the JSON error envelope.
+MAX_PHOTO_URL = 255
 
 INVALID_CREDENTIALS_ERROR = {
     "error": {
@@ -190,6 +195,25 @@ def _clean_name(value):
         return None
     trimmed = value.strip()
     return trimmed or None
+
+
+def _photo_url_value(value):
+    """A photo URL trimmed for storage. A blank string means "no photo",
+    so it is stored as NULL rather than as an empty string."""
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _photo_url_is_valid(value):
+    """A photo is optional everywhere, so null and blank are both accepted
+    and both clear it. Only the type and the length are checked — a
+    relative path is as usable to the site as an absolute URL."""
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    return len(value.strip()) <= MAX_PHOTO_URL
 
 
 def _find_duplicate_field(model, exclude_id=None, **fields):
@@ -432,6 +456,7 @@ def _serialize_offer(o):
         "id": o.id,
         "title_ar": o.title_ar,
         "title_en": o.title_en,
+        "photo_url": o.photo_url,
         "start_date": o.start_date.isoformat(),
         "end_date": o.end_date.isoformat(),
         "is_active": o.is_active,
@@ -447,6 +472,7 @@ def _serialize_service_variant(v):
         "brand_name_ar": v.brand_name_ar,
         "brand_name_en": v.brand_name_en,
         "price_usd": str(v.price_usd),
+        "photo_url": v.photo_url,
         "is_available": v.is_available,
         "added_at": v.added_at.isoformat() if v.added_at else None,
         "discontinued_at": v.discontinued_at.isoformat() if v.discontinued_at else None,
@@ -467,6 +493,7 @@ def _serialize_service(s):
         "description_ar": s.description_ar,
         "description_en": s.description_en,
         "duration_estimate": s.duration_estimate,
+        "photo_url": s.photo_url,
         "is_available": s.is_available,
         "variants": [_serialize_service_variant(v) for v in s.variants],
         # Sorted by id so a caller can compare two responses without having
@@ -506,6 +533,9 @@ def _validate_variant_payload(variant, index, *, required):
         if price < 0:
             return _invalid_variant_error(index, "price_usd")
 
+    if "photo_url" in variant and not _photo_url_is_valid(variant["photo_url"]):
+        return _invalid_variant_error(index, "photo_url")
+
     if "is_available" in variant and not isinstance(variant["is_available"], bool):
         return _invalid_variant_error(index, "is_available")
 
@@ -519,6 +549,8 @@ def _apply_variant_fields(variant_obj, data):
         variant_obj.brand_name_en = data["brand_name_en"]
     if "price_usd" in data:
         variant_obj.price_usd = float(data["price_usd"])
+    if "photo_url" in data:
+        variant_obj.photo_url = _photo_url_value(data["photo_url"])
     if "is_available" in data:
         variant_obj.is_available = data["is_available"]
 
@@ -740,6 +772,9 @@ def create_service():
             and not isinstance(data["is_available"], bool):
         return jsonify(_invalid_field_error("is_available")), 400
 
+    if "photo_url" in data and not _photo_url_is_valid(data["photo_url"]):
+        return jsonify(_invalid_field_error("photo_url")), 400
+
     category = Category.query.get(data["category_id"])
     if not category:
         return jsonify(CATEGORY_NOT_FOUND_ERROR), 400
@@ -778,6 +813,7 @@ def create_service():
         description_ar=data.get("description_ar"),
         description_en=data.get("description_en"),
         duration_estimate=data.get("duration_estimate"),
+        photo_url=_photo_url_value(data.get("photo_url")),
         is_available=data.get("is_available", True),
     )
     if concerns is not None:
@@ -793,6 +829,7 @@ def create_service():
             brand_name_ar=v["brand_name_ar"],
             brand_name_en=v["brand_name_en"],
             price_usd=float(v["price_usd"]),
+            photo_url=_photo_url_value(v.get("photo_url")),
             is_available=v.get("is_available", True),
         ))
 
@@ -839,6 +876,9 @@ def update_service(service_id):
             and not isinstance(data["duration_estimate"], int):
         return jsonify(_invalid_field_error("duration_estimate")), 400
 
+    if "photo_url" in fields_present and not _photo_url_is_valid(data["photo_url"]):
+        return jsonify(_invalid_field_error("photo_url")), 400
+
     if "is_available" in fields_present and not isinstance(data["is_available"], bool):
         return jsonify(_invalid_field_error("is_available")), 400
 
@@ -883,6 +923,11 @@ def update_service(service_id):
         if field in fields_present:
             setattr(service, field, data[field])
 
+    # Trimmed rather than stored raw, so clearing the field in the admin
+    # form (which sends "") lands as NULL, like a photo never set.
+    if "photo_url" in fields_present:
+        service.photo_url = _photo_url_value(data["photo_url"])
+
     # Assigning the full list replaces the association rows outright, so a
     # shorter list really does unlink the ones left out.
     if concerns is not None:
@@ -902,6 +947,7 @@ def update_service(service_id):
                     brand_name_ar=v["brand_name_ar"],
                     brand_name_en=v["brand_name_en"],
                     price_usd=float(v["price_usd"]),
+                    photo_url=_photo_url_value(v.get("photo_url")),
                     is_available=v.get("is_available", True),
                 ))
 
@@ -1129,6 +1175,9 @@ def create_doctor():
         if field in data and data[field] is not None and not isinstance(data[field], str):
             return jsonify(_invalid_field_error(field)), 400
 
+    if "photo_url" in data and not _photo_url_is_valid(data["photo_url"]):
+        return jsonify(_invalid_field_error("photo_url")), 400
+
     if "is_available" in data and data["is_available"] is not None \
             and not isinstance(data["is_available"], bool):
         return jsonify(_invalid_field_error("is_available")), 400
@@ -1177,6 +1226,9 @@ def update_doctor(doctor_id):
     for field in DOCTOR_STRING_FIELDS:
         if field in fields_present and data[field] is not None and not isinstance(data[field], str):
             return jsonify(_invalid_field_error(field)), 400
+
+    if "photo_url" in fields_present and not _photo_url_is_valid(data["photo_url"]):
+        return jsonify(_invalid_field_error("photo_url")), 400
 
     if "is_available" in fields_present and not isinstance(data["is_available"], bool):
         return jsonify(_invalid_field_error("is_available")), 400
@@ -1274,6 +1326,9 @@ def create_offer():
             and not isinstance(data["is_active"], bool):
         return jsonify(_invalid_field_error("is_active")), 400
 
+    if "photo_url" in data and not _photo_url_is_valid(data["photo_url"]):
+        return jsonify(_invalid_field_error("photo_url")), 400
+
     items_data = data["items"]
     if not isinstance(items_data, list) or not items_data:
         return jsonify(_invalid_field_error("items")), 400
@@ -1300,6 +1355,7 @@ def create_offer():
     offer = Offer(
         title_ar=title_ar,
         title_en=title_en,
+        photo_url=_photo_url_value(data.get("photo_url")),
         start_date=start_date,
         end_date=end_date,
         is_active=data.get("is_active", True),
@@ -1364,6 +1420,9 @@ def update_offer(offer_id):
             and new_start_date > new_end_date:
         return jsonify(_invalid_date_range_error()), 400
 
+    if "photo_url" in fields_present and not _photo_url_is_valid(data["photo_url"]):
+        return jsonify(_invalid_field_error("photo_url")), 400
+
     if "is_active" in fields_present and not isinstance(data["is_active"], bool):
         return jsonify(_invalid_field_error("is_active")), 400
 
@@ -1425,6 +1484,8 @@ def update_offer(offer_id):
         offer.end_date = new_end_date
     if "is_active" in fields_present:
         offer.is_active = data["is_active"]
+    if "photo_url" in fields_present:
+        offer.photo_url = _photo_url_value(data["photo_url"])
 
     # `items` is the offer's complete intended set of live brands: entries
     # are updated in place or added, and anything left out is deactivated.

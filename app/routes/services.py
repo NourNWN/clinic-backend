@@ -78,6 +78,7 @@ def get_services():
             "description_ar": s.description_ar,
             "description_en": s.description_en,
             "duration_estimate": s.duration_estimate,
+            "photo_url": s.photo_url,
             "category": {
                 "id": s.category.id,
                 "name_ar": s.category.name_ar,
@@ -133,6 +134,7 @@ def get_service_detail(service_id):
                     "offer_item_id": item.id,
                     "offer_id": offer.id,
                     "title_ar": offer.title_ar,
+                    "photo_url": offer.photo_url,
                     "offer_price_syp": str(item.offer_price_syp),
                     "end_date": offer.end_date.isoformat(),
                 }
@@ -143,6 +145,7 @@ def get_service_detail(service_id):
             "brand_name_ar": v.brand_name_ar,
             "brand_name_en": v.brand_name_en,
             "price_usd": str(v.price_usd),
+            "photo_url": v.photo_url,
             "is_available": v.is_available,
             "active_offer": active_offer,
         })
@@ -154,6 +157,7 @@ def get_service_detail(service_id):
         "description_ar": service.description_ar,
         "description_en": service.description_en,
         "duration_estimate": service.duration_estimate,
+        "photo_url": service.photo_url,
         "category": {
             "id": service.category.id,
             "name_ar": service.category.name_ar,

@@ -111,3 +111,38 @@ class TestAdminUnaffected:
             headers={"Authorization": f"Bearer {reception_token}"},
         )
         assert [s["id"] for s in r.get_json()] == [service.id]
+
+
+class TestPublicPhotos:
+    """A photo reaches the public site on the service, on each bookable brand,
+    and on the banner of whichever offer is live for that brand."""
+
+    def test_list_and_detail_expose_the_service_photo(self, client, service, variant):
+        service.photo_url = "https://cdn.example.com/service.jpg"
+        db.session.commit()
+
+        assert client.get("/api/services").get_json()[0]["photo_url"] == \
+            "https://cdn.example.com/service.jpg"
+        detail = client.get(f"/api/services/{service.id}").get_json()
+        assert detail["photo_url"] == "https://cdn.example.com/service.jpg"
+
+    def test_detail_exposes_each_brand_photo(self, client, service, variant):
+        variant.photo_url = "/uploads/brand.png"
+        db.session.commit()
+
+        detail = client.get(f"/api/services/{service.id}").get_json()
+        assert detail["variants"][0]["photo_url"] == "/uploads/brand.png"
+
+    def test_an_active_offer_carries_its_own_banner(self, client, service, variant, offer):
+        offer.photo_url = "/uploads/offer.png"
+        db.session.commit()
+
+        detail = client.get(f"/api/services/{service.id}").get_json()
+        assert detail["variants"][0]["active_offer"]["photo_url"] == "/uploads/offer.png"
+
+    def test_unset_photos_are_reported_as_null(self, client, service, variant, offer):
+        detail = client.get(f"/api/services/{service.id}").get_json()
+        assert detail["photo_url"] is None
+        assert detail["variants"][0]["photo_url"] is None
+        assert detail["variants"][0]["active_offer"]["photo_url"] is None
+        assert client.get("/api/services").get_json()[0]["photo_url"] is None

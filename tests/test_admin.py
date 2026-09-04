@@ -1419,6 +1419,294 @@ class TestOfferItemRemoval:
 
 
 # ---------------------------------------------------------------------------
+# Catalogue photos (services, brands, offers)
+# ---------------------------------------------------------------------------
+
+PHOTO_URL = "https://cdn.example.com/photo.jpg"
+# Exactly the 255 characters the column holds, and one character past it.
+LIMIT_PHOTO_URL = "https://example.com/" + "a" * 235
+TOO_LONG_PHOTO_URL = LIMIT_PHOTO_URL + "a"
+
+
+class TestServicePhotos:
+    def test_create_stores_and_returns_the_photo(self, client, manager_token, category):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                  "photo_url": PHOTO_URL},
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_surrounding_whitespace_is_trimmed(self, client, manager_token, category):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                  "photo_url": f"  {PHOTO_URL}  "},
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_service_created_without_a_photo_reports_null(self, client, manager_token, category):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service"},
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] is None
+
+    def test_update_sets_the_photo(self, client, manager_token, service):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_an_update_that_omits_the_key_leaves_the_photo_alone(
+        self, client, manager_token, service
+    ):
+        service.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"name_en": "Renamed"},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_blank_string_clears_the_photo(self, client, manager_token, service):
+        service.photo_url = PHOTO_URL
+        db.session.commit()
+
+        # The admin form sends "" for a cleared input; it has to land as NULL
+        # rather than as an empty string the site would render as a broken img.
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": ""},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] is None
+        assert service.photo_url is None
+
+    def test_null_clears_the_photo(self, client, manager_token, service):
+        service.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": None},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] is None
+
+    def test_a_url_at_the_column_limit_is_accepted(self, client, manager_token, service):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": LIMIT_PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == LIMIT_PHOTO_URL
+
+    def test_a_url_past_the_column_limit_is_a_400(self, client, manager_token, service):
+        # Without the length check this reaches psycopg2 as a DataError and
+        # comes back as an HTML 500 instead of the JSON error envelope.
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_a_non_string_photo_is_rejected(self, client, manager_token, service):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": 42},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_an_over_long_photo_is_rejected_on_create_too(
+        self, client, manager_token, category
+    ):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                  "photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert Service.query.count() == 0
+
+
+class TestBrandPhotos:
+    def test_a_brand_created_with_the_service_keeps_its_photo(
+        self, client, manager_token, category
+    ):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={
+                "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                "variants": [{"brand_name_ar": "أ", "brand_name_en": "A",
+                              "price_usd": 50, "photo_url": "/uploads/brand.png"}],
+            },
+        )
+        assert r.status_code == 201
+        assert r.get_json()["variants"][0]["photo_url"] == "/uploads/brand.png"
+
+    def test_update_sets_an_existing_brands_photo(
+        self, client, manager_token, service, variant
+    ):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "photo_url": PHOTO_URL}]},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["variants"][0]["photo_url"] == PHOTO_URL
+
+    def test_a_brand_added_by_an_update_keeps_its_photo(
+        self, client, manager_token, service, variant
+    ):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [
+                {"id": variant.id},
+                {"brand_name_ar": "جديد", "brand_name_en": "New",
+                 "price_usd": 30, "photo_url": PHOTO_URL},
+            ]},
+        )
+        assert r.status_code == 200
+        added = next(v for v in r.get_json()["variants"] if v["id"] != variant.id)
+        assert added["photo_url"] == PHOTO_URL
+
+    def test_blank_string_clears_a_brand_photo(
+        self, client, manager_token, service, variant
+    ):
+        variant.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "photo_url": ""}]},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["variants"][0]["photo_url"] is None
+
+    def test_an_over_long_brand_photo_names_the_brand_that_failed(
+        self, client, manager_token, category
+    ):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={
+                "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                "variants": [
+                    {"brand_name_ar": "أ", "brand_name_en": "A", "price_usd": 50},
+                    {"brand_name_ar": "ب", "brand_name_en": "B", "price_usd": 60,
+                     "photo_url": TOO_LONG_PHOTO_URL},
+                ],
+            },
+        )
+        assert r.status_code == 400
+        body = r.get_json()
+        assert body["error"]["code"] == "validation_error"
+        assert "#2" in body["error"]["message_en"]
+        assert "photo_url" in body["error"]["message_en"]
+
+    def test_a_non_string_brand_photo_is_rejected(
+        self, client, manager_token, service, variant
+    ):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "photo_url": ["a"]}]},
+        )
+        assert r.status_code == 400
+
+
+class TestOfferPhotos:
+    def _payload(self, variant, **overrides):
+        payload = {
+            "title_ar": "عرض", "title_en": "Offer",
+            "start_date": str(date.today()),
+            "end_date": str(date.today() + timedelta(days=5)),
+            "items": [{"service_variant_id": variant.id, "offer_price_syp": 500000}],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_create_stores_the_banner(self, client, manager_token, variant):
+        r = client.post(
+            "/api/admin/offers", headers=auth_headers(manager_token),
+            json=self._payload(variant, photo_url="/uploads/offer.png"),
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] == "/uploads/offer.png"
+
+    def test_an_offer_without_a_banner_reports_null(self, client, manager_token, variant):
+        r = client.post(
+            "/api/admin/offers", headers=auth_headers(manager_token),
+            json=self._payload(variant),
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] is None
+
+    def test_update_replaces_the_banner(self, client, manager_token, offer):
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"photo_url": PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_blank_string_clears_the_banner(self, client, manager_token, offer):
+        offer.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"photo_url": ""},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] is None
+
+    def test_an_over_long_banner_is_a_400(self, client, manager_token, offer):
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+
+class TestDoctorPhotoLength:
+    """doctors.photo_url predates this feature but shares the same 255-char
+    column, so an over-long URL used to reach the driver as a 500."""
+
+    def test_create_rejects_an_over_long_photo(self, client, manager_token):
+        r = client.post(
+            "/api/admin/doctors", headers=auth_headers(manager_token),
+            json={"name_ar": "د", "name_en": "D", "photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+        assert Doctor.query.count() == 0
+
+    def test_update_rejects_an_over_long_photo(self, client, manager_token, doctor):
+        r = client.put(
+            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token),
+            json={"photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+
+    def test_a_photo_at_the_limit_still_works(self, client, manager_token, doctor):
+        r = client.put(
+            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token),
+            json={"photo_url": LIMIT_PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == LIMIT_PHOTO_URL
+
+
+# ---------------------------------------------------------------------------
 # Exchange rate (manager-only)
 # ---------------------------------------------------------------------------
 
