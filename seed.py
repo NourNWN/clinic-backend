@@ -90,6 +90,11 @@ with app.app_context():
     db.session.add_all(concerns.values())
 
     # ---------- الطبيبات/الأطباء ----------
+    # Deliberately left without photo_url. Stock portraits here would put a
+    # real stranger's face on the site under an invented doctor's name, which
+    # is worse than the initials avatar the team section already falls back
+    # to (and which reads cleanly). These get the clinic's own staff
+    # photographs, added through the admin panel.
     doctors = {
         "sara": Doctor(
             name_ar="د. سارة أحمد", name_en="Dr. Sara Ahmad",
@@ -113,6 +118,28 @@ with app.app_context():
     db.session.add_all(doctors.values())
 
     db.session.commit()  # لازم نحفظ هون حتى ناخد الـ id تبعهم قبل الخطوة الجاية
+
+    # ---------- صور الخدمات ----------
+    # Stock photography, so the demo shows the catalogue the way a visitor
+    # would see it rather than a page of empty cards. Every one of these was
+    # checked by eye against the treatment it is attached to — an image that
+    # merely matches the search term is often of something else entirely.
+    #
+    # These are placeholders for the clinic's own photographs. `photo_url` is
+    # free-form, so replacing one is an edit in the admin panel, not a
+    # deployment. Photos of identifiable staff at other clinics, and coats
+    # carrying another clinic's branding, were deliberately passed over.
+    UNSPLASH = "https://images.unsplash.com/{photo}?w=1200&q=70"
+    service_photos = {
+        "botox": "photo-1785861084191-3600dfc2a6d6",
+        "fillers": "photo-1746017062285-13c77e29fc25",
+        "peel": "photo-1570172619644-dfd03ed5d881",
+        "hydrafacial": "photo-1713085085470-fba013d67e65",
+        "laser_full": "photo-1700760933574-9f0f4ea9aa3b",
+        "laser_face": "photo-1785861775561-c6db7da314a0",
+        "cleansing_facial": "photo-1616394584738-fc6e612e71b9",
+        "antiaging_facial": "photo-1782159981439-b99dfb84f4b8",
+    }
 
     # ---------- الخدمات وماركاتها ----------
     services_data = [
@@ -229,6 +256,7 @@ with app.app_context():
             name_ar=data["name_ar"], name_en=data["name_en"],
             description_ar=data["description_ar"], description_en=data["description_en"],
             duration_estimate=data["duration_estimate"],
+            photo_url=UNSPLASH.format(photo=service_photos[data["key"]]),
         )
         service.concerns = [concerns[key] for key in data["concerns"]]
         service.doctors = [doctors[key] for key in data["doctors"]]
@@ -273,6 +301,7 @@ with app.app_context():
 
     # ---------- عروض ترويجية ----------
     summer_offer = Offer(
+        photo_url=UNSPLASH.format(photo="photo-1700760933574-9f0f4ea9aa3b"),
         title_ar="عرض الصيف", title_en="Summer Offer",
         start_date=date.today() - timedelta(days=1),
         end_date=date.today() + timedelta(days=10),
@@ -280,6 +309,7 @@ with app.app_context():
         created_by=manager.id,
     )
     new_client_offer = Offer(
+        photo_url=UNSPLASH.format(photo="photo-1785861001619-b263ebd4e615"),
         title_ar="عرض العميل الجديد", title_en="New Client Offer",
         start_date=date.today() - timedelta(days=5),
         end_date=date.today() + timedelta(days=20),

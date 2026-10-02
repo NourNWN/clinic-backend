@@ -1,6 +1,9 @@
 from datetime import date, datetime, timedelta
+from io import BytesIO
 
-from flask import Blueprint, g, jsonify, request
+import cloudinary
+import cloudinary.uploader
+from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy.orm import joinedload
 from werkzeug.security import check_password_hash
 
@@ -48,6 +51,32 @@ REQUIRED_OFFER_ITEM_FIELDS = ["service_variant_id", "offer_price_syp"]
 # and doctors. Without the check an over-long URL only fails at the driver,
 # as a psycopg2 DataError — an HTML 500 instead of the JSON error envelope.
 MAX_PHOTO_URL = 255
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+ALLOWED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+INVALID_FILE_ERROR = {
+    "error": {
+        "code": "invalid_file",
+        "message_ar": "الملف المرفوع يجب أن يكون صورة بصيغة JPEG أو PNG أو WebP",
+        "message_en": "Uploaded file must be a JPEG, PNG, or WebP image",
+    }
+}
+
+FILE_TOO_LARGE_ERROR = {
+    "error": {
+        "code": "file_too_large",
+        "message_ar": "حجم الصورة يجب ألا يتجاوز 5 ميغابايت",
+        "message_en": "Image file must not exceed 5 MB",
+    }
+}
+
+UPLOAD_FAILED_ERROR = {
+    "error": {
+        "code": "upload_failed",
+        "message_ar": "فشل رفع الصورة، حاولي مرة أخرى",
+        "message_en": "Image upload failed, please try again",
+    }
+}
 
 INVALID_CREDENTIALS_ERROR = {
     "error": {
@@ -223,6 +252,17 @@ def _photo_url_is_valid(value):
     if not isinstance(value, str):
         return False
     return len(value.strip()) <= MAX_PHOTO_URL
+
+
+def _image_bytes_match_type(image_bytes, mime_type):
+    """Verify the image signature as well as the client-supplied MIME type."""
+    if mime_type == "image/jpeg":
+        return image_bytes.startswith(b"\xff\xd8\xff")
+    if mime_type == "image/png":
+        return image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    if mime_type == "image/webp":
+        return len(image_bytes) >= 12 and image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP"
+    return False
 
 
 def _find_duplicate_field(model, exclude_id=None, **fields):
@@ -612,6 +652,54 @@ def _login_rate_limit_key():
     against staff.
     """
     return request.remote_addr or "unknown"
+
+
+@admin_bp.route("/api/admin/upload", methods=["POST"])
+@require_role("manager")
+def upload_image():
+    """Upload one validated catalogue image and return Cloudinary's hosted URL."""
+    image = request.files.get("image")
+    if image is None or not image.filename:
+        return jsonify(INVALID_FILE_ERROR), 400
+
+    # Temporary diagnostic logging for PNG upload investigation. This records
+    # only metadata and a short magic-number prefix, never the file contents.
+    # Remove after we have captured the failing request.
+    image_bytes = image.stream.read(MAX_IMAGE_BYTES + 1)
+    mime_type = image.mimetype.lower() if image.mimetype else ""
+    current_app.logger.warning(
+        "Upload debug: content_type=%r mimetype=%r magic_bytes=%s",
+        image.headers.get("Content-Type"),
+        mime_type,
+        image_bytes[:16].hex(" "),
+    )
+    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+        return jsonify(INVALID_FILE_ERROR), 400
+
+    # Do not trust Content-Length: it is optional and describes the whole
+    # multipart request, not necessarily this individual file.
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        return jsonify(FILE_TOO_LARGE_ERROR), 400
+    if not _image_bytes_match_type(image_bytes, mime_type):
+        return jsonify(INVALID_FILE_ERROR), 400
+
+    cloudinary.config(
+        cloud_name=current_app.config["CLOUDINARY_CLOUD_NAME"],
+        api_key=current_app.config["CLOUDINARY_API_KEY"],
+        api_secret=current_app.config["CLOUDINARY_API_SECRET"],
+        secure=True,
+    )
+    try:
+        uploaded = cloudinary.uploader.upload(
+            BytesIO(image_bytes), resource_type="image"
+        )
+        url = uploaded.get("secure_url")
+        if not url:
+            raise ValueError("Cloudinary response did not contain secure_url")
+    except Exception:
+        return jsonify(UPLOAD_FAILED_ERROR), 502
+
+    return jsonify({"url": url})
 
 
 @admin_bp.route("/api/admin/login", methods=["POST"])

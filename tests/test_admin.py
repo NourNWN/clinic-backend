@@ -1,3 +1,4 @@
+from io import BytesIO
 import time
 from datetime import date, timedelta
 
@@ -1844,3 +1845,81 @@ class TestExchangeRate:
     def test_requires_auth(self, client):
         r = client.put("/api/admin/exchange-rate", json={"rate": 15000})
         assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Generic image upload (manager-only)
+# ---------------------------------------------------------------------------
+
+class TestImageUpload:
+    JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"small test image"
+
+    def _upload(self, client, token=None, image=None, filename="image.jpg",
+                content_type="image/jpeg"):
+        headers = auth_headers(token) if token else {}
+        data = {} if image is None else {
+            "image": (BytesIO(image), filename, content_type),
+        }
+        return client.post("/api/admin/upload", headers=headers, data=data)
+
+    def test_uploads_valid_jpeg_and_returns_cloudinary_url(self, client, manager_token, monkeypatch):
+        from app.routes import admin as admin_routes
+
+        monkeypatch.setattr(
+            admin_routes.cloudinary.uploader,
+            "upload",
+            lambda stream, resource_type: {"secure_url": "https://res.cloudinary.com/demo/image/upload/test.jpg"},
+        )
+
+        response = self._upload(client, manager_token, self.JPEG_BYTES)
+
+        assert response.status_code == 200
+        assert response.get_json() == {
+            "url": "https://res.cloudinary.com/demo/image/upload/test.jpg"
+        }
+
+    def test_rejects_non_image_even_when_named_jpg(self, client, manager_token):
+        response = self._upload(client, manager_token, b"not an image")
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "invalid_file"
+
+    def test_rejects_unsupported_content_type(self, client, manager_token):
+        response = self._upload(
+            client, manager_token, b"%PDF-1.7", filename="file.pdf",
+            content_type="application/pdf",
+        )
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "invalid_file"
+
+    def test_rejects_files_larger_than_five_megabytes(self, client, manager_token):
+        image = b"\xff\xd8\xff" + b"x" * (5 * 1024 * 1024)
+        response = self._upload(client, manager_token, image)
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "file_too_large"
+
+    def test_requires_authentication(self, client):
+        response = self._upload(client, image=self.JPEG_BYTES)
+
+        assert response.status_code == 401
+        assert response.get_json()["error"]["code"] == "unauthorized"
+
+    def test_forbids_reception_user(self, client, reception_token):
+        response = self._upload(client, reception_token, self.JPEG_BYTES)
+
+        assert response.status_code == 403
+        assert response.get_json()["error"]["code"] == "forbidden"
+
+    def test_returns_gateway_error_when_cloudinary_fails(self, client, manager_token, monkeypatch):
+        from app.routes import admin as admin_routes
+
+        def fail_upload(*args, **kwargs):
+            raise RuntimeError("bad Cloudinary credentials")
+
+        monkeypatch.setattr(admin_routes.cloudinary.uploader, "upload", fail_upload)
+        response = self._upload(client, manager_token, self.JPEG_BYTES)
+
+        assert response.status_code == 502
+        assert response.get_json()["error"]["code"] == "upload_failed"
