@@ -1,6 +1,9 @@
 from datetime import date
 from flask import Blueprint, jsonify, request
-from app.models import Category, Concern, Doctor, Service, ServiceVariant, ExchangeRate
+from sqlalchemy.orm import joinedload
+from app.models import (
+    Category, Concern, Doctor, ExchangeRate, Offer, OfferItem, Service, ServiceVariant,
+)
 
 services_bp = Blueprint("services", __name__)
 
@@ -78,6 +81,7 @@ def get_services():
             "description_ar": s.description_ar,
             "description_en": s.description_en,
             "duration_estimate": s.duration_estimate,
+            "photo_url": s.photo_url,
             "category": {
                 "id": s.category.id,
                 "name_ar": s.category.name_ar,
@@ -133,6 +137,7 @@ def get_service_detail(service_id):
                     "offer_item_id": item.id,
                     "offer_id": offer.id,
                     "title_ar": offer.title_ar,
+                    "photo_url": offer.photo_url,
                     "offer_price_syp": str(item.offer_price_syp),
                     "end_date": offer.end_date.isoformat(),
                 }
@@ -143,6 +148,7 @@ def get_service_detail(service_id):
             "brand_name_ar": v.brand_name_ar,
             "brand_name_en": v.brand_name_en,
             "price_usd": str(v.price_usd),
+            "photo_url": v.photo_url,
             "is_available": v.is_available,
             "active_offer": active_offer,
         })
@@ -154,6 +160,7 @@ def get_service_detail(service_id):
         "description_ar": service.description_ar,
         "description_en": service.description_en,
         "duration_estimate": service.duration_estimate,
+        "photo_url": service.photo_url,
         "category": {
             "id": service.category.id,
             "name_ar": service.category.name_ar,
@@ -169,6 +176,75 @@ def get_service_detail(service_id):
         ],
         "variants": variants_data,
     })
+
+
+@services_bp.route("/api/offers")
+def get_offers():
+    """Every offer a patient can act on right now. The admin endpoint lists
+    scheduled and expired ones too; here an offer is either running today or
+    it does not exist."""
+    today = date.today()
+
+    offers = (
+        Offer.query.options(
+            joinedload(Offer.items)
+            .joinedload(OfferItem.service_variant)
+            .joinedload(ServiceVariant.service)
+        )
+        .filter(
+            Offer.is_active.is_(True),
+            Offer.start_date <= today,
+            Offer.end_date >= today,
+        )
+        # Soonest to expire first: the one worth acting on is the one about
+        # to end, not the one that happens to have the lowest id.
+        .order_by(Offer.end_date.asc(), Offer.id.asc())
+        .all()
+    )
+
+    result = []
+    for offer in offers:
+        items = []
+        for item in offer.items:
+            variant = item.service_variant
+            # A brand removed from the offer keeps its row so past bookings
+            # still resolve, and the same visibility rules as /api/services
+            # apply on top: an offer must not advertise a brand, or a
+            # treatment, that nobody can actually book.
+            if not item.is_active or not variant.is_available \
+                    or not variant.service.is_available:
+                continue
+
+            items.append({
+                "offer_item_id": item.id,
+                "service_variant_id": variant.id,
+                "brand_name_ar": variant.brand_name_ar,
+                "brand_name_en": variant.brand_name_en,
+                "price_usd": str(variant.price_usd),
+                "offer_price_syp": str(item.offer_price_syp),
+                "service": {
+                    "id": variant.service.id,
+                    "name_ar": variant.service.name_ar,
+                    "name_en": variant.service.name_en,
+                },
+            })
+
+        # An offer whose brands have all been withdrawn has nothing left to
+        # sell, so it is left out rather than shown as an empty card.
+        if not items:
+            continue
+
+        result.append({
+            "id": offer.id,
+            "title_ar": offer.title_ar,
+            "title_en": offer.title_en,
+            "photo_url": offer.photo_url,
+            "start_date": offer.start_date.isoformat(),
+            "end_date": offer.end_date.isoformat(),
+            "items": items,
+        })
+
+    return jsonify(result)
 
 
 @services_bp.route("/api/exchange-rate")

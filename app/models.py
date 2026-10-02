@@ -68,6 +68,7 @@ class Service(db.Model):
     description_ar = db.Column(db.Text)
     description_en = db.Column(db.Text)
     duration_estimate = db.Column(db.Integer)  # بالدقائق
+    photo_url = db.Column(db.String(255))
     is_available = db.Column(db.Boolean, default=True, nullable=False)
 
     category = db.relationship("Category", backref="services")
@@ -87,6 +88,7 @@ class ServiceVariant(db.Model):
     brand_name_ar = db.Column(db.String(100), nullable=False)
     brand_name_en = db.Column(db.String(100), nullable=False)
     price_usd = db.Column(db.Numeric(10, 2), nullable=False)
+    photo_url = db.Column(db.String(255))
     is_available = db.Column(db.Boolean, default=True, nullable=False)
     added_at = db.Column(db.DateTime, default=datetime.utcnow)
     discontinued_at = db.Column(db.DateTime, nullable=True)
@@ -117,6 +119,7 @@ class Offer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title_ar = db.Column(db.String(150), nullable=False)
     title_en = db.Column(db.String(150), nullable=False)
+    photo_url = db.Column(db.String(255))
     start_date = db.Column(db.Date, nullable=False)
     end_date = db.Column(db.Date, nullable=False)
     is_active = db.Column(db.Boolean, default=True, nullable=False)

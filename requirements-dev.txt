@@ -1,2 +1,5 @@
 -r requirements.txt
 pytest==9.1.1
+# gunicorn (see Procfile) is Unix-only; waitress serves wsgi:app on Windows
+# for verifying the production entry point locally.
+waitress==3.0.2

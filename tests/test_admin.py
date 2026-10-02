@@ -1,3 +1,4 @@
+from io import BytesIO
 import time
 from datetime import date, timedelta
 
@@ -5,6 +6,7 @@ import jwt
 import pytest
 from flask import current_app
 
+from app import rate_limit
 from app.auth import _authenticate
 
 from app.extensions import db
@@ -68,6 +70,97 @@ class TestLogin:
         r = client.post("/api/admin/login", data="username=x&password=y", content_type="text/plain")
         assert r.is_json
         assert r.get_json()["error"]["code"] == "invalid_credentials"
+
+
+# ---------------------------------------------------------------------------
+# Login brute-force protection
+# ---------------------------------------------------------------------------
+
+class TestLoginRateLimit:
+    """The login endpoint used to accept unlimited guesses at full speed."""
+
+    def _fail(self, client, username="manager1"):
+        return client.post(
+            "/api/admin/login", json={"username": username, "password": "wrong"}
+        )
+
+    def test_failures_up_to_the_limit_still_answer_401(self, client, manager_user):
+        for _ in range(rate_limit.MAX_FAILURES):
+            r = self._fail(client)
+            assert r.status_code == 401
+            assert r.get_json()["error"]["code"] == "invalid_credentials"
+
+    def test_one_failure_past_the_limit_locks_out(self, client, manager_user):
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client)
+
+        r = self._fail(client)
+        assert r.status_code == 429
+        assert r.get_json()["error"]["code"] == "too_many_attempts"
+        assert int(r.headers["Retry-After"]) > 0
+
+    def test_lockout_blocks_the_correct_password_too(self, client, manager_user):
+        """Otherwise the limit is decorative: a guesser who lands on the right
+        password on attempt N+1 would still be let in."""
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client)
+
+        r = client.post(
+            "/api/admin/login",
+            json={"username": "manager1", "password": "manager-pass"},
+        )
+        assert r.status_code == 429
+
+    def test_lockout_is_not_per_username(self, client, manager_user, reception_user):
+        """The counter is keyed on the caller, not the account they name, so
+        switching usernames does not buy a fresh allowance."""
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client, username="manager1")
+
+        r = self._fail(client, username="reception1")
+        assert r.status_code == 429
+
+    def test_success_clears_the_counter(self, client, manager_user):
+        """Four typos then the right password must not leave the user one
+        slip from a lockout."""
+        for _ in range(rate_limit.MAX_FAILURES - 1):
+            self._fail(client)
+
+        ok = client.post(
+            "/api/admin/login",
+            json={"username": "manager1", "password": "manager-pass"},
+        )
+        assert ok.status_code == 200
+
+        # A full fresh allowance, not one attempt.
+        for _ in range(rate_limit.MAX_FAILURES):
+            assert self._fail(client).status_code == 401
+
+    def test_malformed_requests_do_not_count_toward_the_limit(self, client, manager_user):
+        """A buggy client sending empty bodies is not guessing passwords, and
+        must not be able to lock the clinic out of its own panel."""
+        for _ in range(rate_limit.MAX_FAILURES * 2):
+            assert client.post("/api/admin/login", json={}).status_code == 401
+
+        r = client.post(
+            "/api/admin/login",
+            json={"username": "manager1", "password": "manager-pass"},
+        )
+        assert r.status_code == 200
+
+    def test_failures_age_out_of_the_window(self, client, manager_user, monkeypatch):
+        for _ in range(rate_limit.MAX_FAILURES):
+            self._fail(client)
+        assert self._fail(client).status_code == 429
+
+        # Jump past the window rather than sleeping through it.
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            rate_limit.time,
+            "monotonic",
+            lambda: real_monotonic() + rate_limit.WINDOW_SECONDS + 1,
+        )
+        assert self._fail(client).status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -1419,6 +1512,294 @@ class TestOfferItemRemoval:
 
 
 # ---------------------------------------------------------------------------
+# Catalogue photos (services, brands, offers)
+# ---------------------------------------------------------------------------
+
+PHOTO_URL = "https://cdn.example.com/photo.jpg"
+# Exactly the 255 characters the column holds, and one character past it.
+LIMIT_PHOTO_URL = "https://example.com/" + "a" * 235
+TOO_LONG_PHOTO_URL = LIMIT_PHOTO_URL + "a"
+
+
+class TestServicePhotos:
+    def test_create_stores_and_returns_the_photo(self, client, manager_token, category):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                  "photo_url": PHOTO_URL},
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_surrounding_whitespace_is_trimmed(self, client, manager_token, category):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                  "photo_url": f"  {PHOTO_URL}  "},
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_service_created_without_a_photo_reports_null(self, client, manager_token, category):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service"},
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] is None
+
+    def test_update_sets_the_photo(self, client, manager_token, service):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_an_update_that_omits_the_key_leaves_the_photo_alone(
+        self, client, manager_token, service
+    ):
+        service.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"name_en": "Renamed"},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_blank_string_clears_the_photo(self, client, manager_token, service):
+        service.photo_url = PHOTO_URL
+        db.session.commit()
+
+        # The admin form sends "" for a cleared input; it has to land as NULL
+        # rather than as an empty string the site would render as a broken img.
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": ""},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] is None
+        assert service.photo_url is None
+
+    def test_null_clears_the_photo(self, client, manager_token, service):
+        service.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": None},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] is None
+
+    def test_a_url_at_the_column_limit_is_accepted(self, client, manager_token, service):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": LIMIT_PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == LIMIT_PHOTO_URL
+
+    def test_a_url_past_the_column_limit_is_a_400(self, client, manager_token, service):
+        # Without the length check this reaches psycopg2 as a DataError and
+        # comes back as an HTML 500 instead of the JSON error envelope.
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_a_non_string_photo_is_rejected(self, client, manager_token, service):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"photo_url": 42},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+    def test_an_over_long_photo_is_rejected_on_create_too(
+        self, client, manager_token, category
+    ):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={"category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                  "photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert Service.query.count() == 0
+
+
+class TestBrandPhotos:
+    def test_a_brand_created_with_the_service_keeps_its_photo(
+        self, client, manager_token, category
+    ):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={
+                "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                "variants": [{"brand_name_ar": "أ", "brand_name_en": "A",
+                              "price_usd": 50, "photo_url": "/uploads/brand.png"}],
+            },
+        )
+        assert r.status_code == 201
+        assert r.get_json()["variants"][0]["photo_url"] == "/uploads/brand.png"
+
+    def test_update_sets_an_existing_brands_photo(
+        self, client, manager_token, service, variant
+    ):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "photo_url": PHOTO_URL}]},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["variants"][0]["photo_url"] == PHOTO_URL
+
+    def test_a_brand_added_by_an_update_keeps_its_photo(
+        self, client, manager_token, service, variant
+    ):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [
+                {"id": variant.id},
+                {"brand_name_ar": "جديد", "brand_name_en": "New",
+                 "price_usd": 30, "photo_url": PHOTO_URL},
+            ]},
+        )
+        assert r.status_code == 200
+        added = next(v for v in r.get_json()["variants"] if v["id"] != variant.id)
+        assert added["photo_url"] == PHOTO_URL
+
+    def test_blank_string_clears_a_brand_photo(
+        self, client, manager_token, service, variant
+    ):
+        variant.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "photo_url": ""}]},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["variants"][0]["photo_url"] is None
+
+    def test_an_over_long_brand_photo_names_the_brand_that_failed(
+        self, client, manager_token, category
+    ):
+        r = client.post(
+            "/api/admin/services", headers=auth_headers(manager_token),
+            json={
+                "category_id": category.id, "name_ar": "خدمة", "name_en": "Service",
+                "variants": [
+                    {"brand_name_ar": "أ", "brand_name_en": "A", "price_usd": 50},
+                    {"brand_name_ar": "ب", "brand_name_en": "B", "price_usd": 60,
+                     "photo_url": TOO_LONG_PHOTO_URL},
+                ],
+            },
+        )
+        assert r.status_code == 400
+        body = r.get_json()
+        assert body["error"]["code"] == "validation_error"
+        assert "#2" in body["error"]["message_en"]
+        assert "photo_url" in body["error"]["message_en"]
+
+    def test_a_non_string_brand_photo_is_rejected(
+        self, client, manager_token, service, variant
+    ):
+        r = client.put(
+            f"/api/admin/services/{service.id}", headers=auth_headers(manager_token),
+            json={"variants": [{"id": variant.id, "photo_url": ["a"]}]},
+        )
+        assert r.status_code == 400
+
+
+class TestOfferPhotos:
+    def _payload(self, variant, **overrides):
+        payload = {
+            "title_ar": "عرض", "title_en": "Offer",
+            "start_date": str(date.today()),
+            "end_date": str(date.today() + timedelta(days=5)),
+            "items": [{"service_variant_id": variant.id, "offer_price_syp": 500000}],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_create_stores_the_banner(self, client, manager_token, variant):
+        r = client.post(
+            "/api/admin/offers", headers=auth_headers(manager_token),
+            json=self._payload(variant, photo_url="/uploads/offer.png"),
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] == "/uploads/offer.png"
+
+    def test_an_offer_without_a_banner_reports_null(self, client, manager_token, variant):
+        r = client.post(
+            "/api/admin/offers", headers=auth_headers(manager_token),
+            json=self._payload(variant),
+        )
+        assert r.status_code == 201
+        assert r.get_json()["photo_url"] is None
+
+    def test_update_replaces_the_banner(self, client, manager_token, offer):
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"photo_url": PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == PHOTO_URL
+
+    def test_blank_string_clears_the_banner(self, client, manager_token, offer):
+        offer.photo_url = PHOTO_URL
+        db.session.commit()
+
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"photo_url": ""},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] is None
+
+    def test_an_over_long_banner_is_a_400(self, client, manager_token, offer):
+        r = client.put(
+            f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
+            json={"photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+
+
+class TestDoctorPhotoLength:
+    """doctors.photo_url predates this feature but shares the same 255-char
+    column, so an over-long URL used to reach the driver as a 500."""
+
+    def test_create_rejects_an_over_long_photo(self, client, manager_token):
+        r = client.post(
+            "/api/admin/doctors", headers=auth_headers(manager_token),
+            json={"name_ar": "د", "name_en": "D", "photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "validation_error"
+        assert Doctor.query.count() == 0
+
+    def test_update_rejects_an_over_long_photo(self, client, manager_token, doctor):
+        r = client.put(
+            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token),
+            json={"photo_url": TOO_LONG_PHOTO_URL},
+        )
+        assert r.status_code == 400
+
+    def test_a_photo_at_the_limit_still_works(self, client, manager_token, doctor):
+        r = client.put(
+            f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token),
+            json={"photo_url": LIMIT_PHOTO_URL},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["photo_url"] == LIMIT_PHOTO_URL
+
+
+# ---------------------------------------------------------------------------
 # Exchange rate (manager-only)
 # ---------------------------------------------------------------------------
 
@@ -1464,3 +1845,81 @@ class TestExchangeRate:
     def test_requires_auth(self, client):
         r = client.put("/api/admin/exchange-rate", json={"rate": 15000})
         assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Generic image upload (manager-only)
+# ---------------------------------------------------------------------------
+
+class TestImageUpload:
+    JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"small test image"
+
+    def _upload(self, client, token=None, image=None, filename="image.jpg",
+                content_type="image/jpeg"):
+        headers = auth_headers(token) if token else {}
+        data = {} if image is None else {
+            "image": (BytesIO(image), filename, content_type),
+        }
+        return client.post("/api/admin/upload", headers=headers, data=data)
+
+    def test_uploads_valid_jpeg_and_returns_cloudinary_url(self, client, manager_token, monkeypatch):
+        from app.routes import admin as admin_routes
+
+        monkeypatch.setattr(
+            admin_routes.cloudinary.uploader,
+            "upload",
+            lambda stream, resource_type: {"secure_url": "https://res.cloudinary.com/demo/image/upload/test.jpg"},
+        )
+
+        response = self._upload(client, manager_token, self.JPEG_BYTES)
+
+        assert response.status_code == 200
+        assert response.get_json() == {
+            "url": "https://res.cloudinary.com/demo/image/upload/test.jpg"
+        }
+
+    def test_rejects_non_image_even_when_named_jpg(self, client, manager_token):
+        response = self._upload(client, manager_token, b"not an image")
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "invalid_file"
+
+    def test_rejects_unsupported_content_type(self, client, manager_token):
+        response = self._upload(
+            client, manager_token, b"%PDF-1.7", filename="file.pdf",
+            content_type="application/pdf",
+        )
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "invalid_file"
+
+    def test_rejects_files_larger_than_five_megabytes(self, client, manager_token):
+        image = b"\xff\xd8\xff" + b"x" * (5 * 1024 * 1024)
+        response = self._upload(client, manager_token, image)
+
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "file_too_large"
+
+    def test_requires_authentication(self, client):
+        response = self._upload(client, image=self.JPEG_BYTES)
+
+        assert response.status_code == 401
+        assert response.get_json()["error"]["code"] == "unauthorized"
+
+    def test_forbids_reception_user(self, client, reception_token):
+        response = self._upload(client, reception_token, self.JPEG_BYTES)
+
+        assert response.status_code == 403
+        assert response.get_json()["error"]["code"] == "forbidden"
+
+    def test_returns_gateway_error_when_cloudinary_fails(self, client, manager_token, monkeypatch):
+        from app.routes import admin as admin_routes
+
+        def fail_upload(*args, **kwargs):
+            raise RuntimeError("bad Cloudinary credentials")
+
+        monkeypatch.setattr(admin_routes.cloudinary.uploader, "upload", fail_upload)
+        response = self._upload(client, manager_token, self.JPEG_BYTES)
+
+        assert response.status_code == 502
+        assert response.get_json()["error"]["code"] == "upload_failed"
