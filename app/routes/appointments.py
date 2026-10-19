@@ -121,7 +121,7 @@ def create_appointment():
     #    variant's own flag alone, so checking the variant by itself would let
     #    a withdrawn treatment keep taking bookings. Same error either way —
     #    the public site hides both cases identically.
-    variant = ServiceVariant.query.get(service_variant_id)
+    variant = db.session.get(ServiceVariant, service_variant_id)
     if not variant or not variant.is_available or not variant.service.is_available:
         return jsonify({
             "error": {
@@ -131,7 +131,7 @@ def create_appointment():
             }
         }), 400
 
-    doctor = Doctor.query.get(doctor_id)
+    doctor = db.session.get(Doctor, doctor_id)
     if not doctor:
         return jsonify({
             "error": {
@@ -185,7 +185,7 @@ def create_appointment():
         if offer_item_id is None:
             return jsonify(_invalid_field_error("offer_item_id")), 400
 
-        offer_item = OfferItem.query.get(offer_item_id)
+        offer_item = db.session.get(OfferItem, offer_item_id)
         today = date.today()
 
         valid_offer = (

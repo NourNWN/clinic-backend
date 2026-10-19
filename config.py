@@ -2,7 +2,7 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()  # يقرأ ملف .env ويحمّله كمتغيرات بيئة
+load_dotenv()
 
 # The value this app used to fall back to when SECRET_KEY was unset. It is
 # public knowledge — it sat in this file in every clone of the repository —
@@ -24,27 +24,41 @@ def _split_origins(raw):
 
 
 class Config:
+    APP_ENV = os.environ.get("APP_ENV", "development").lower()
+
+    SECRET_KEY = os.environ.get("SECRET_KEY")
+
+    if not SECRET_KEY:
+        if APP_ENV == "production":
+            raise RuntimeError(
+                "SECRET_KEY must be set in production."
+            )
+        SECRET_KEY = "dev-secret-change-me"
+
+    if APP_ENV == "production":
+        if SECRET_KEY == "dev-secret-change-me":
+            raise RuntimeError(
+                "The default SECRET_KEY cannot be used in production."
+            )
+        if len(SECRET_KEY.encode("utf-8")) < 32:
+            raise RuntimeError(
+                "SECRET_KEY must be at least 32 bytes in production."
+            )
+
     SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SECRET_KEY = os.environ.get("SECRET_KEY")
     CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
     CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
     CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 
-    # Which origins may call this API from a browser. Previously every
-    # origin could, which let any page on the internet drive the API with a
-    # visitor's browser.
+    # Which origins may call this API from a browser.
     CORS_ORIGINS = _split_origins(os.environ.get("CORS_ORIGINS"))
 
 
 def validate(config):
     """
-    Fail startup on a configuration that would be unsafe or broken in a
-    deployment, rather than booting and misbehaving later.
-
-    Called from `create_app`, so the error surfaces as a clean startup
-    failure naming the variable to set — not as a forged-token incident
-    months later, or a 500 on the first database query.
+    Fail startup on a configuration that would be unsafe or broken
+    in a deployment.
     """
     secret = config.get("SECRET_KEY")
     if not secret:

@@ -7,8 +7,7 @@ from dotenv import load_dotenv
 from sqlalchemy.engine import make_url
 from werkzeug.security import generate_password_hash
 
-os.environ.setdefault("SECRET_KEY", "test-secret-key")
-
+os.environ["SECRET_KEY"] = "test-only-secret-key-for-pytest-32-bytes-minimum"
 
 # ---------------------------------------------------------------------------
 # Test database

@@ -792,10 +792,15 @@ def get_appointments():
 @admin_bp.route("/api/admin/appointments/<int:appointment_id>", methods=["PATCH"])
 @require_auth
 def update_appointment(appointment_id):
-    appointment = Appointment.query.options(
-        joinedload(Appointment.service_variant).joinedload(ServiceVariant.service),
-        joinedload(Appointment.doctor),
-    ).get(appointment_id)
+    appointment = db.session.execute(
+        db.select(Appointment)
+        .options(
+            joinedload(Appointment.service_variant).joinedload(ServiceVariant.service),
+            joinedload(Appointment.doctor),
+        )
+        .where(Appointment.id == appointment_id)
+    ).unique().scalar_one_or_none()
+
     if not appointment:
         return jsonify(APPOINTMENT_NOT_FOUND_ERROR), 404
 
@@ -894,10 +899,11 @@ def create_service():
             and not isinstance(data["is_available"], bool):
         return jsonify(_invalid_field_error("is_available")), 400
 
+
     if "photo_url" in data and not _photo_url_is_valid(data["photo_url"]):
         return jsonify(_invalid_field_error("photo_url")), 400
 
-    category = Category.query.get(data["category_id"])
+    category = db.session.get(Category, data["category_id"])
     if not category:
         return jsonify(CATEGORY_NOT_FOUND_ERROR), 400
 
@@ -963,12 +969,17 @@ def create_service():
 @admin_bp.route("/api/admin/services/<int:service_id>", methods=["PUT"])
 @require_role("manager")
 def update_service(service_id):
-    service = Service.query.options(
-        joinedload(Service.category),
-        joinedload(Service.variants),
-        joinedload(Service.concerns),
-        joinedload(Service.doctors),
-    ).get(service_id)
+    service = db.session.execute(
+        db.select(Service)
+        .options(
+            joinedload(Service.category),
+            joinedload(Service.variants),
+            joinedload(Service.concerns),
+            joinedload(Service.doctors),
+        )
+        .where(Service.id == service_id)
+    ).unique().scalar_one_or_none()
+
     if not service:
         return jsonify(SERVICE_NOT_FOUND_ERROR), 404
 
@@ -987,7 +998,7 @@ def update_service(service_id):
     if "category_id" in fields_present:
         if not isinstance(data["category_id"], int):
             return jsonify(_invalid_field_error("category_id")), 400
-        if not Category.query.get(data["category_id"]):
+        if not db.session.get(Category, data["category_id"]):
             return jsonify(CATEGORY_NOT_FOUND_ERROR), 400
 
     for field in ("name_ar", "name_en"):
@@ -1081,7 +1092,7 @@ def update_service(service_id):
 @admin_bp.route("/api/admin/services/<int:service_id>", methods=["DELETE"])
 @require_role("manager")
 def delete_service(service_id):
-    service = Service.query.get(service_id)
+    service = db.session.get(Service, service_id)
     if not service:
         return jsonify(SERVICE_NOT_FOUND_ERROR), 404
 
@@ -1132,7 +1143,7 @@ def create_category():
 @admin_bp.route("/api/admin/categories/<int:category_id>", methods=["PUT"])
 @require_role("manager")
 def update_category(category_id):
-    category = Category.query.get(category_id)
+    category = db.session.get(Category, category_id)
     if not category:
         return jsonify(CATEGORY_NOT_FOUND_ERROR), 404
 
@@ -1218,7 +1229,7 @@ def create_concern():
 @admin_bp.route("/api/admin/concerns/<int:concern_id>", methods=["PUT"])
 @require_role("manager")
 def update_concern(concern_id):
-    concern = Concern.query.get(concern_id)
+    concern = db.session.get(Concern, concern_id)
     if not concern:
         return jsonify(CONCERN_NOT_FOUND_ERROR), 404
 
@@ -1330,7 +1341,12 @@ def create_doctor():
 @admin_bp.route("/api/admin/doctors/<int:doctor_id>", methods=["PUT"])
 @require_role("manager")
 def update_doctor(doctor_id):
-    doctor = Doctor.query.options(joinedload(Doctor.services)).get(doctor_id)
+    doctor = db.session.execute(
+        db.select(Doctor)
+        .options(joinedload(Doctor.services))
+        .where(Doctor.id == doctor_id)
+    ).unique().scalar_one_or_none()
+
     if not doctor:
         return jsonify(DOCTOR_NOT_FOUND_ERROR), 404
 
@@ -1382,7 +1398,7 @@ def update_doctor(doctor_id):
 @admin_bp.route("/api/admin/doctors/<int:doctor_id>", methods=["DELETE"])
 @require_role("manager")
 def delete_doctor(doctor_id):
-    doctor = Doctor.query.get(doctor_id)
+    doctor = db.session.get(Doctor, doctor_id)
     if not doctor:
         return jsonify(DOCTOR_NOT_FOUND_ERROR), 404
 
@@ -1496,14 +1512,32 @@ def create_offer():
 
     db.session.commit()
 
-    offer = _offer_query().get(offer.id)
+    offer = db.session.execute(
+        db.select(Offer)
+        .options(
+            joinedload(Offer.items)
+            .joinedload(OfferItem.service_variant)
+            .joinedload(ServiceVariant.service)
+        )
+        .where(Offer.id == offer.id)
+    ).unique().scalar_one_or_none()
+
     return jsonify(_serialize_offer(offer)), 201
 
 
 @admin_bp.route("/api/admin/offers/<int:offer_id>", methods=["PUT"])
 @require_role("manager")
 def update_offer(offer_id):
-    offer = _offer_query().get(offer_id)
+    offer = db.session.execute(
+        db.select(Offer)
+        .options(
+            joinedload(Offer.items)
+            .joinedload(OfferItem.service_variant)
+            .joinedload(ServiceVariant.service)
+        )
+        .where(Offer.id == offer_id)
+    ).unique().scalar_one_or_none()
+
     if not offer:
         return jsonify(OFFER_NOT_FOUND_ERROR), 404
 
@@ -1651,14 +1685,23 @@ def update_offer(offer_id):
 
     db.session.commit()
 
-    offer = _offer_query().get(offer.id)
+    offer = db.session.execute(
+        db.select(Offer)
+        .options(
+            joinedload(Offer.items)
+            .joinedload(OfferItem.service_variant)
+            .joinedload(ServiceVariant.service)
+        )
+        .where(Offer.id == offer.id)
+    ).unique().scalar_one_or_none()
+
     return jsonify(_serialize_offer(offer))
 
 
 @admin_bp.route("/api/admin/offers/<int:offer_id>", methods=["DELETE"])
 @require_role("manager")
 def delete_offer(offer_id):
-    offer = Offer.query.get(offer_id)
+    offer = db.session.get(Offer, offer_id)
     if not offer:
         return jsonify(OFFER_NOT_FOUND_ERROR), 404
 
@@ -1669,7 +1712,17 @@ def delete_offer(offer_id):
         offer.is_active = False
         db.session.commit()
 
-    return jsonify(_serialize_offer(_offer_query().get(offer.id)))
+    offer = db.session.execute(
+        db.select(Offer)
+        .options(
+            joinedload(Offer.items)
+            .joinedload(OfferItem.service_variant)
+            .joinedload(ServiceVariant.service)
+        )
+        .where(Offer.id == offer.id)
+    ).unique().scalar_one_or_none()
+
+    return jsonify(_serialize_offer(offer))
 
 
 def _serialize_exchange_rate(r):

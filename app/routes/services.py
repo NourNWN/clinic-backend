@@ -1,3 +1,4 @@
+from app import db
 from datetime import date
 from flask import Blueprint, jsonify, request
 from sqlalchemy.orm import joinedload
@@ -103,7 +104,7 @@ def get_services():
 
 @services_bp.route("/api/services/<int:service_id>")
 def get_service_detail(service_id):
-    service = Service.query.get(service_id)
+    service = db.session.get(Service, service_id)
 
     # Same 404 whether the service doesn't exist, is hidden, or has no
     # available brands left — the public API doesn't distinguish between

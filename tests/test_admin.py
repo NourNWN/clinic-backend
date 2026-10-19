@@ -191,7 +191,7 @@ class TestAuthGuard:
 
     def test_wrong_signature_401(self, client, app, manager_user):
         bad_token = jwt.encode(
-            {"sub": str(manager_user.id), "role": "manager"}, "wrong-secret", algorithm="HS256"
+            {"sub": str(manager_user.id), "role": "manager"}, "wrong-signature-test-secret-at-least-32-bytes", algorithm="HS256"
         )
         r = client.get(self.PROTECTED_GET, headers={"Authorization": f"Bearer {bad_token}"})
         assert r.status_code == 401
@@ -224,7 +224,7 @@ class TestAuthGuard:
 
     def test_wrong_signature_is_unauthorized_not_token_expired(self, client, manager_user):
         bad_token = jwt.encode(
-            {"sub": str(manager_user.id), "role": "manager"}, "wrong-secret", algorithm="HS256"
+            {"sub": str(manager_user.id), "role": "manager"}, "wrong-signature-test-secret-at-least-32-bytes", algorithm="HS256"
         )
         r = client.get(self.PROTECTED_GET, headers={"Authorization": f"Bearer {bad_token}"})
         assert r.get_json()["error"]["code"] == "unauthorized"
@@ -410,8 +410,8 @@ class TestAppointments:
         date instead put the window on the wrong day for the first hours
         after local midnight in any timezone ahead of UTC.
 
-        The narrowness itself is a known fragility — anything completed more
-        than seven days ago is never surfaced again — but it is the current
+        The narrowness itself is a known fragility - anything completed more
+        than seven days ago is never surfaced again - but it is the current
         contract, so it is pinned here rather than left implicit.
         """
         from datetime import datetime
@@ -594,7 +594,7 @@ class TestRolePermissions:
     """The reception/manager split, asserted as a matrix.
 
     Reception runs the front desk: they read the catalogue and work the
-    appointment list. Managing what the clinic offers — and what it charges —
+    appointment list. Managing what the clinic offers - and what it charges -
     is the manager's. Catalogue writes were previously guarded only by
     `require_auth`, which let a reception account reprice every brand.
     """
@@ -668,7 +668,7 @@ class TestRolePermissions:
 
     def test_missing_token_is_401_not_403_on_a_catalogue_write(self, client, service):
         """An anonymous caller is unauthenticated, not merely under-privileged
-        — the client redirects to login on 401 and shows a message on 403."""
+        - the client redirects to login on 401 and shows a message on 403."""
         r = client.delete(f"/api/admin/services/{service.id}")
         assert r.status_code == 401
         assert r.get_json()["error"]["code"] == "unauthorized"
@@ -807,7 +807,7 @@ class TestServices:
         r = client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(manager_token))
         assert r.status_code == 200
         assert r.get_json()["is_available"] is False
-        assert Service.query.get(service.id) is not None
+        assert db.session.get(Service, service.id) is not None
 
     def test_delete_idempotent(self, client, manager_token, service):
         client.delete(f"/api/admin/services/{service.id}", headers=auth_headers(manager_token))
@@ -857,7 +857,7 @@ class TestServiceRelationships:
         )
         assert r.status_code == 400
         assert r.get_json()["error"]["code"] == "invalid_concern_id"
-        # The whole request is rejected — no service row is left behind.
+        # The whole request is rejected - no service row is left behind.
         assert Service.query.filter_by(name_en="Service").first() is None
 
     def test_create_with_invalid_doctor_id(self, client, manager_token, category):
@@ -941,7 +941,7 @@ class TestServiceRelationships:
         assert r.get_json()["error"]["code"] == "invalid_concern_id"
 
         db.session.expire_all()
-        refreshed = Service.query.get(service.id)
+        refreshed = db.session.get(Service, service.id)
         # Neither the scalar field nor the relationship was touched.
         assert refreshed.name_en != "Should Not Persist"
         assert [c.id for c in refreshed.concerns] == [concern.id]
@@ -960,7 +960,7 @@ class TestServiceRelationships:
         assert r.get_json()["error"]["code"] == "invalid_doctor_id"
 
         db.session.expire_all()
-        refreshed = Service.query.get(service.id)
+        refreshed = db.session.get(Service, service.id)
         assert refreshed.name_en != "Should Not Persist"
         assert [d.id for d in refreshed.doctors] == [doctor.id]
 
@@ -1173,7 +1173,7 @@ class TestDoctors:
         r = client.delete(f"/api/admin/doctors/{doctor.id}", headers=auth_headers(manager_token))
         assert r.status_code == 200
         assert r.get_json()["is_available"] is False
-        assert Doctor.query.get(doctor.id) is not None
+        assert db.session.get(Doctor, doctor.id) is not None
 
     def test_delete_not_found(self, client, manager_token):
         r = client.delete("/api/admin/doctors/999999", headers=auth_headers(manager_token))
@@ -1326,7 +1326,7 @@ class TestOffers:
         r = client.delete(f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token))
         assert r.status_code == 200
         assert r.get_json()["is_active"] is False
-        assert Offer.query.get(offer.id) is not None
+        assert db.session.get(Offer, offer.id) is not None
         assert len(OfferItem.query.filter_by(offer_id=offer.id).all()) == 1
 
     def test_delete_not_found(self, client, manager_token):
@@ -1387,7 +1387,7 @@ class TestOfferItemRemoval:
 
         by_id = {i["id"]: i for i in r.get_json()["items"]}
         assert by_id[original_id]["is_active"] is False, "removed item should be flagged"
-        assert OfferItem.query.get(original_id) is not None, "row must survive for FK safety"
+        assert db.session.get(OfferItem, original_id) is not None, "row must survive for FK safety"
 
     def test_removed_item_disappears_from_the_public_site(
         self, client, manager_token, offer, variant, service
@@ -1407,7 +1407,7 @@ class TestOfferItemRemoval:
         detail = client.get(f"/api/services/{service.id}").get_json()
         after = next(v for v in detail["variants"] if v["id"] == variant.id)
         assert after["active_offer"] is None
-        assert OfferItem.query.get(item_id) is not None
+        assert db.session.get(OfferItem, item_id) is not None
 
     def test_removed_item_cannot_price_a_new_booking(
         self, client, manager_token, offer, variant, doctor, service
@@ -1471,13 +1471,13 @@ class TestOfferItemRemoval:
         )
         assert r.status_code == 200
         assert all(i["is_active"] is False for i in r.get_json()["items"])
-        assert OfferItem.query.get(item_id) is not None
+        assert db.session.get(OfferItem, item_id) is not None
 
     def test_omitting_items_entirely_leaves_them_untouched(
         self, client, manager_token, offer
     ):
         """Absent key means "don't touch", same as everywhere else in the API
-        — only an explicit `items` array rewrites the set."""
+        - only an explicit `items` array rewrites the set."""
         r = client.put(
             f"/api/admin/offers/{offer.id}", headers=auth_headers(manager_token),
             json={"title_en": "Renamed"},
