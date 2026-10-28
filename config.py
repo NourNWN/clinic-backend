@@ -50,6 +50,7 @@ class Config:
     CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
     CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
     CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
+    MAX_CONTENT_LENGTH = 6 * 1024 * 1024
 
     # Which origins may call this API from a browser.
     CORS_ORIGINS = _split_origins(os.environ.get("CORS_ORIGINS"))

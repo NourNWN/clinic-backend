@@ -662,17 +662,9 @@ def upload_image():
     if image is None or not image.filename:
         return jsonify(INVALID_FILE_ERROR), 400
 
-    # Temporary diagnostic logging for PNG upload investigation. This records
-    # only metadata and a short magic-number prefix, never the file contents.
-    # Remove after we have captured the failing request.
     image_bytes = image.stream.read(MAX_IMAGE_BYTES + 1)
     mime_type = image.mimetype.lower() if image.mimetype else ""
-    current_app.logger.warning(
-        "Upload debug: content_type=%r mimetype=%r magic_bytes=%s",
-        image.headers.get("Content-Type"),
-        mime_type,
-        image_bytes[:16].hex(" "),
-    )
+
     if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
         return jsonify(INVALID_FILE_ERROR), 400
 
